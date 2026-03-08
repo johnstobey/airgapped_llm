@@ -550,6 +550,9 @@ See the main [README.md](../README.md) for complete documentation.
 
 ## Connection Notes
 
+
+### Setup mac mount on pop_os
+
 On linux run:
 
 ```bash
@@ -569,7 +572,7 @@ sshfs \
 fusermount -uz /mnt/t7
 ```
 
-### (Optional) Make it persistent with systemd (recommended)
+#### (Optional) Make it persistent with systemd (recommended)
 
 
 Check:
@@ -577,3 +580,29 @@ Check:
 ```bash
 findmnt /mnt/t7_mac
 ```
+
+### Setup ssh host on mac
+
+Add to ~/.ssh/config
+
+```bash
+Host popos
+    HostName 192.168.68.142
+    User admin
+    IdentityFile /Volumes/T7/airgapped_llm/airgap/.ssh/id_rsa
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+```
+
+### Connect with Cursor/Code/etc to the host popos
+
+1. Go to Remote - SSH plugin
+2. Connect to popos in SSH targets
+3. Open airgap in a new connection
+4. Make changes
+5. Run ./get_bundle.sh
+6. Run ./install_offline.sh in UTM PopOS as a test
+7. If successful, disconnect/eject drive
+8. Connect drive to airgapped PopOS
+9. cd into the airgap directory
+10. Run ./install_offline.sh
