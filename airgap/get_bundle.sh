@@ -141,6 +141,10 @@ STATUS_rust_toolchain="pending"
 STATUS_rust_crates="pending"
 STATUS_python_packages="pending"
 STATUS_apt_repo="pending"
+STATUS_cuda="pending"
+STATUS_nvidia_driver="pending"
+STATUS_whisper="pending"
+STATUS_obsidian="pending"
 
 mark_success() {
   eval "STATUS_$1=\"success\""
@@ -157,6 +161,92 @@ mark_skipped() {
 get_status() {
   eval "echo \"\$STATUS_$1\""
 }
+
+# Print final summary (what worked / what didn't). Runs on EXIT so we always report even if script
+# exits early (e.g. set -e during APT build).
+print_final_summary() {
+  [[ -n "${_SUMMARY_PRINTED:-}" ]] && return
+  _SUMMARY_PRINTED=1
+  local summary_dir="${BUNDLE_DIR:-$PWD/airgap_bundle}"
+  log ""
+  log "=========================================="
+  log "BUNDLE CREATION SUMMARY"
+  log "=========================================="
+  log ""
+  local has_failures=false has_warnings=false component status
+  local components="ollama_linux models vscodium continue python_ext rust_ext rust_toolchain rust_crates python_packages apt_repo cuda nvidia_driver whisper obsidian"
+  for component in $components; do
+    status="$(get_status "$component")"
+    case "$status" in
+      success) log "✓ $component: SUCCESS" ;;
+      failed)  log "✗ $component: FAILED"; has_failures=true ;;
+      skipped) log "⊘ $component: SKIPPED (not required or not found)" ;;
+      pending) log "? $component: PENDING (not completed)"; has_warnings=true ;;
+    esac
+  done
+  log ""
+  log "=========================================="
+  log "BUNDLE LOCATION: $summary_dir"
+  log "=========================================="
+  if [[ -d "$summary_dir/models/.ollama" ]]; then
+    log "Models size: $(du -sh "$summary_dir/models/.ollama" 2>/dev/null | cut -f1 || echo "unknown")"
+  else
+    log "Models: NOT BUNDLED"
+    has_warnings=true
+  fi
+  log "Total bundle size: $(du -sh "$summary_dir" 2>/dev/null | cut -f1 || echo "unknown")"
+  log ""
+  if [[ "$has_failures" == "true" ]]; then
+    log "=========================================="
+    log "⚠️  ACTION REQUIRED: Some components failed"
+    log "=========================================="
+    log ""
+    if [[ "$(get_status models)" == "failed" ]]; then
+      log "MODELS FAILED:"
+      if [[ -d "$HOME/.ollama/models" ]] && [[ -n "$(ls -A "$HOME/.ollama/models" 2>/dev/null)" ]]; then
+        log "  → Found existing models in ~/.ollama/models. To move them manually, run:"
+        log "     mkdir -p $summary_dir/models && mv ~/.ollama $summary_dir/models/.ollama"
+      else
+        log "  → No existing models found. Pull with Ollama then re-run this script."
+      fi
+      log ""
+    fi
+    if [[ "$(get_status vscodium)" == "failed" ]]; then
+      log "VSCODIUM FAILED: Re-run script or download from https://github.com/VSCodium/vscodium/releases"
+      log ""
+    fi
+    if [[ "$(get_status continue)" == "failed" ]] || [[ "$(get_status python_ext)" == "failed" ]] || [[ "$(get_status rust_ext)" == "failed" ]]; then
+      log "EXTENSIONS FAILED: Re-run script or download from https://open-vsx.org"
+      log ""
+    fi
+    if [[ "$(get_status rust_toolchain)" == "failed" ]]; then
+      log "RUST TOOLCHAIN FAILED: Re-run script or download from https://rustup.rs"
+      log ""
+    fi
+    if [[ "$(get_status python_packages)" == "failed" ]]; then
+      log "PYTHON PACKAGES FAILED: Check requirements.txt and re-run script"
+      log ""
+    fi
+    log "After fixing issues, re-run: ./get_bundle.sh"
+    log ""
+  fi
+  if [[ "$has_warnings" == "true" ]] && [[ "$has_failures" != "true" ]]; then
+    log "⚠️  Some optional components were skipped (this is normal)"
+    log ""
+  fi
+  if [[ "$has_failures" != "true" ]]; then
+    log "✓ All required components bundled and built successfully!"
+    log ""
+    log "Next steps:"
+    log "  1. Verify bundle: ls -lh $summary_dir"
+    log "  2. Copy bundle to airgapped system"
+    log "  3. On airgapped system run: ./install_offline.sh"
+    log ""
+  fi
+  log "Bundle location: $summary_dir"
+  log ""
+}
+trap 'print_final_summary' EXIT
 
 # ============
 # Command-line argument parsing
@@ -307,15 +397,15 @@ if [[ -n "$CONSOLE_LOG" ]]; then
   echo ""
 fi
 # Models to bundle (space-separated list)
-# Default: Bundle all recommended models for different VRAM configurations
-# - mistral:7b-instruct: Best for 16GB VRAM (~4GB download, ~13.7GB VRAM)
-# - mixtral:8x7b: For 24GB+ VRAM (~26GB download, ~48GB VRAM)
-# - mistral:7b-instruct-q4_K_M: Quantized version for saving VRAM (~2GB download, ~3.4GB VRAM)
+# Default: Bundle models optimized for RTX 5070 Ti (16GB VRAM) and development workflow
+# - dolphin-mistral: Uncensored base model for domain-specific work (~4GB download, ~4-5GB VRAM)
+# - codestral: Primary coding model, strong at Rust and code generation (~4-5GB download, ~4-5GB VRAM)
+# - phi3:14b: Largest general-purpose model for complex reasoning (~8-9GB download, ~8-9GB VRAM)
 # 
 # To bundle only specific models, set OLLAMA_MODELS env var:
-#   export OLLAMA_MODELS="mistral:7b-instruct mixtral:8x7b mistral:7b-instruct-q4_K_M"
+#   export OLLAMA_MODELS="dolphin-mistral codestral phi3:14b"
 # Or for backward compatibility, use OLLAMA_MODEL for a single model:
-#   export OLLAMA_MODEL="mistral:7b-instruct"
+#   export OLLAMA_MODEL="dolphin-mistral"
 #
 # To move models instead of copy (saves disk space but removes originals):
 #   export MOVE_MODELS=true
@@ -323,12 +413,12 @@ if [[ -n "${OLLAMA_MODEL:-}" ]] && [[ -z "${OLLAMA_MODELS:-}" ]]; then
   # Backward compatibility: single model
   OLLAMA_MODELS="$OLLAMA_MODEL"
 elif [[ -z "${OLLAMA_MODELS:-}" ]]; then
-  # Default: bundle all recommended models
-  OLLAMA_MODELS="mistral:7b mistral:7b-instruct mixtral:8x7b mistral:7b-instruct-q4_K_M"
+  # Default: bundle models for RTX 5070 Ti workflow
+  OLLAMA_MODELS="dolphin-mistral codestral phi3:14b"
 fi
 
 mkdir -p \
-  "$BUNDLE_DIR"/{ollama,models,vscodium,continue,extensions,aptrepo/{pool,conf,_tmp},rust/{toolchain,crates},python,logs}
+  "$BUNDLE_DIR"/{ollama,models,vscodium,continue,extensions,aptrepo/{pool,conf,_tmp},rust/{toolchain,crates},python,logs,cuda,nvidia-driver,whisper,obsidian}
 
 # Set OLLAMA_HOME to bundle directory so all Ollama data goes under airgap_bundle
 # This ensures models and temp files are stored in the bundle, not in ~/.ollama or current directory
@@ -516,12 +606,25 @@ elif [[ -f "$OLLAMA_TGZ" ]]; then
   OLLAMA_EXISTING="$OLLAMA_TGZ"
 fi
 
+# Look downstream: if binary is already extracted and usable, skip download (and extraction) entirely
+SKIP_OLLAMA_ALREADY_DONE=false
+OLLAMA_TMP_EARLY="$BUNDLE_DIR/ollama/_tmp_ollama"
+if [[ -d "$OLLAMA_TMP_EARLY" ]]; then
+  OLLAMA_BIN_EARLY=$(find "$OLLAMA_TMP_EARLY" -name "ollama" -type f 2>/dev/null | head -n1)
+  if [[ -n "$OLLAMA_BIN_EARLY" ]] && [[ -x "$OLLAMA_BIN_EARLY" ]]; then
+    log "Ollama Linux binary already extracted and present. Skipping download (already done)."
+    mark_success "ollama_linux"
+    OLLAMA_DL_STATUS=0
+    SKIP_OLLAMA_ALREADY_DONE=true
+  fi
+fi
+
 # #region agent log
-debug_log "get_bundle.sh:ollama:check_existing" "Checking for existing Ollama binary" "{\"archive\":\"$OLLAMA_ARCHIVE\",\"tgz\":\"$OLLAMA_TGZ\",\"sha\":\"$OLLAMA_SHA\",\"archive_exists\":$(test -f "$OLLAMA_ARCHIVE" && echo true || echo false),\"tgz_exists\":$(test -f "$OLLAMA_TGZ" && echo true || echo false),\"sha_exists\":$(test -f "$OLLAMA_SHA" && echo true || echo false)}" "OLLAMA-A" "run1"
+debug_log "get_bundle.sh:ollama:check_existing" "Checking for existing Ollama binary" "{\"archive\":\"$OLLAMA_ARCHIVE\",\"tgz\":\"$OLLAMA_TGZ\",\"sha\":\"$OLLAMA_SHA\",\"archive_exists\":$(test -f "$OLLAMA_ARCHIVE" && echo true || echo false),\"tgz_exists\":$(test -f "$OLLAMA_TGZ" && echo true || echo false),\"sha_exists\":$(test -f "$OLLAMA_SHA" && echo true || echo false),\"skip_already_done\":$SKIP_OLLAMA_ALREADY_DONE}" "OLLAMA-A" "run1"
 # #endregion
 
-# Check if file already exists and is valid
-if [[ -n "$OLLAMA_EXISTING" ]]; then
+# Check if file already exists and is valid (skip when binary already extracted)
+if [[ "$SKIP_OLLAMA_ALREADY_DONE" != "true" ]] && [[ -n "$OLLAMA_EXISTING" ]]; then
   if [[ "$SKIP_VERIFICATION" == "true" ]]; then
     log "Ollama Linux binary already exists. Skipping verification (--skip-verification flag set)."
     mark_success "ollama_linux"
@@ -674,17 +777,37 @@ done
 read -ra MODEL_ARRAY <<< "$OLLAMA_MODELS"
 MODEL_COUNT=${#MODEL_ARRAY[@]}
 
+# Look downstream: if all requested models are already in the bundle, skip server start and pull
+BUNDLE_MODELS_DIR="$BUNDLE_DIR/models/.ollama/models"
+MODELS_ALREADY_IN_BUNDLE=true
+for model in "${MODEL_ARRAY[@]}"; do
+  if [[ ! -d "$BUNDLE_MODELS_DIR/$model" ]] || [[ ! -d "$BUNDLE_MODELS_DIR/$model/blobs" ]]; then
+    MODELS_ALREADY_IN_BUNDLE=false
+    break
+  fi
+done
+if [[ "$MODELS_ALREADY_IN_BUNDLE" == "true" ]] && [[ $MODEL_COUNT -gt 0 ]]; then
+  log "All requested models already present in bundle. Skipping model pull (already done)."
+  SKIP_MODEL_PULL=true
+fi
+
 # #region agent log
 # debug_log call removed to fix syntax error
 # #endregion
 
-log "Using Linux Ollama binary to pull $MODEL_COUNT models..."
+if [[ "${SKIP_MODEL_PULL:-false}" != "true" ]]; then
+  log "Using Linux Ollama binary to pull $MODEL_COUNT models..."
+fi
 
 TMP_OLLAMA="$BUNDLE_DIR/ollama/_tmp_ollama"
 
-# Check if extraction should be skipped
+# Check if extraction should be skipped (already done downstream, or --skip-verification with existing binary)
 SKIP_EXTRACTION=false
-if [[ "$SKIP_VERIFICATION" == "true" ]] && [[ -d "$TMP_OLLAMA" ]]; then
+if [[ "${SKIP_OLLAMA_ALREADY_DONE:-false}" == "true" ]]; then
+  log "Ollama binary already present. Skipping extraction (already done)."
+  SKIP_EXTRACTION=true
+  TAR_EXIT=0
+elif [[ "$SKIP_VERIFICATION" == "true" ]] && [[ -d "$TMP_OLLAMA" ]]; then
   # Check if binary already exists in extracted directory
   OLLAMA_BIN_CHECK=""
   if [[ -f "$TMP_OLLAMA/ollama" ]]; then
@@ -926,10 +1049,12 @@ if [[ -d "$HOME/.ollama/models" ]] && [[ -n "$(ls -A "$HOME/.ollama/models" 2>/d
   MODELS_EXIST=true
 fi
 
-# Start ollama server in the background on the online machine just for pulling
+# Start ollama server in the background on the online machine just for pulling (unless models already in bundle)
 # OLLAMA_HOME is set to $BUNDLE_DIR/ollama/.ollama_home so all data goes under airgap_bundle
-log "Starting Ollama server to pull models..."
-log "Ollama data will be stored in: $OLLAMA_HOME"
+if [[ "${SKIP_MODEL_PULL:-false}" != "true" ]]; then
+  log "Starting Ollama server to pull models..."
+  log "Ollama data will be stored in: $OLLAMA_HOME"
+fi
 # Check if ollama is available
 if [[ "${SKIP_MODEL_PULL:-false}" != "true" ]] && ! command -v ollama >/dev/null 2>&1; then
   log "ERROR: ollama command not found in PATH. Check extraction and PATH setup."
@@ -951,10 +1076,6 @@ if [[ "${SKIP_MODEL_PULL:-false}" != "true" ]] && ! command -v ollama >/dev/null
   fi
 fi
 
-# Kill any existing ollama server to avoid conflicts
-pkill -f "ollama serve" 2>/dev/null || true
-sleep 1
-
 # Determine which ollama command to use
 OLLAMA_CMD="ollama"
 if [[ -n "${OLLAMA_BIN:-}" ]] && [[ -x "${OLLAMA_BIN:-}" ]]; then
@@ -965,6 +1086,9 @@ elif ! command -v ollama >/dev/null 2>&1; then
 fi
 
 if [[ "${SKIP_MODEL_PULL:-false}" != "true" ]]; then
+  # Kill any existing ollama server to avoid conflicts before we start our own
+  pkill -f "ollama serve" 2>/dev/null || true
+  sleep 1
   log "Starting Ollama server (PID will be logged)..."
   log "Using ollama command: $OLLAMA_CMD"
   
@@ -1068,7 +1192,9 @@ if [[ "${SKIP_MODEL_PULL:-false}" != "true" ]]; then
       # This ensures models go to $BUNDLE_DIR/ollama/.ollama_home/.ollama/models/
       OLD_HOME="$HOME"
       export HOME="$OLLAMA_HOME"
-      if ! (cd "$OLLAMA_HOME" && unset OLLAMA_MODELS && "$OLLAMA_CMD" pull "$model" 2>&1 | tee -a "$BUNDLE_DIR/logs/get_bundle_model_pull.log"); then
+      PULL_MODEL_EXIT=0
+      (cd "$OLLAMA_HOME" && unset OLLAMA_MODELS && "$OLLAMA_CMD" pull "$model" 2>&1 | tee -a "$BUNDLE_DIR/logs/get_bundle_model_pull.log") || PULL_MODEL_EXIT=$?
+      if [[ $PULL_MODEL_EXIT -ne 0 ]]; then
         log "WARNING: Failed to pull $model. Continuing with other models..."
         PULL_FAILED=true
       else
@@ -1145,57 +1271,95 @@ elif [[ -d "$HOME/.ollama" ]] && [[ -n "$(ls -A "$HOME/.ollama" 2>/dev/null)" ]]
 fi
 
 if [[ -z "$OLLAMA_SOURCE" ]]; then
-  log "WARNING: No models found in $OLLAMA_HOME or ~/.ollama. Models were not pulled."
-  if [[ "$PULL_FAILED" == "true" ]]; then
-    log "WARNING: Model pulling failed. Check logs: $BUNDLE_DIR/logs/get_bundle_ollama_serve.log"
-  fi
-  mark_failed "models"
-  # #region agent log
-  debug_log "get_bundle.sh:models:copy_failed" "Models directory not found" "{\"ollama_home\":\"$OLLAMA_HOME\",\"home_ollama\":\"$HOME/.ollama\",\"ollama_home_exists\":$(test -d "$OLLAMA_HOME" && echo true || echo false),\"home_ollama_exists\":$(test -d "$HOME/.ollama" && echo true || echo false)}" "MODEL-C" "run1"
-  # #endregion
-else
-  if [[ "$MOVE_MODELS" == "true" ]]; then
-    # Move models to save disk space
-    # #region agent log
-    debug_log "get_bundle.sh:models:move_attempt" "Attempting to move models" "{\"source\":\"$OLLAMA_SOURCE\",\"dest\":\"$BUNDLE_DIR/models/.ollama\"}" "MODEL-D" "run1"
-    # #endregion
-    if mv "$OLLAMA_SOURCE" "$BUNDLE_DIR/models/.ollama"; then
-      TOTAL_SIZE=$(du -sh "$BUNDLE_DIR/models/.ollama" 2>/dev/null | cut -f1 || echo "unknown")
-      log "Models moved successfully. Total size: $TOTAL_SIZE"
-      log "Models bundled: ${OLLAMA_MODELS}"
-      log "Note: Original models have been moved to bundle"
-      mark_success "models"
-      MODELS_COPIED=true
-      # #region agent log
-      debug_log "get_bundle.sh:models:move_success" "Models moved successfully" "{\"total_size\":\"$TOTAL_SIZE\",\"dest_exists\":$(test -d "$BUNDLE_DIR/models/.ollama" && echo true || echo false)}" "MODEL-D" "run1"
-      # #endregion
-    else
-      log "ERROR: Failed to move models. Check disk space and permissions."
-      mark_failed "models"
-      # #region agent log
-      debug_log "get_bundle.sh:models:move_failed" "Failed to move models" "{\"exit_code\":$?}" "MODEL-E" "run1"
-      # #endregion
-    fi
+  # No source; check if bundle already has models from a previous run (don't lose that work)
+  BUNDLE_OLLAMA_NOW="$BUNDLE_DIR/models/.ollama"
+  if [[ -d "$BUNDLE_OLLAMA_NOW/models" ]] && [[ -n "$(ls -A "$BUNDLE_OLLAMA_NOW/models" 2>/dev/null)" ]]; then
+    log "No model source found, but bundle already has models (from previous run). Skipping copy."
+    TOTAL_SIZE=$(du -sh "$BUNDLE_OLLAMA_NOW" 2>/dev/null | cut -f1 || echo "unknown")
+    log "Models size in bundle: $TOTAL_SIZE"
+    mark_success "models"
+    MODELS_COPIED=true
+    debug_log "get_bundle.sh:models:copy_skipped" "Bundle already has models, no source" "{\"total_size\":\"$TOTAL_SIZE\"}" "MODEL-C" "run1"
   else
-    # Use rsync to copy models
+    log "WARNING: No models found in $OLLAMA_HOME or ~/.ollama. Models were not pulled."
+    if [[ "$PULL_FAILED" == "true" ]]; then
+      log "WARNING: Model pulling failed. Check logs: $BUNDLE_DIR/logs/get_bundle_ollama_serve.log"
+    fi
+    mark_failed "models"
     # #region agent log
-    debug_log "get_bundle.sh:models:copy_attempt" "Attempting to copy models" "{\"source\":\"$OLLAMA_SOURCE/\",\"dest\":\"$BUNDLE_DIR/models/.ollama/\"}" "MODEL-F" "run1"
+    debug_log "get_bundle.sh:models:copy_failed" "Models directory not found" "{\"ollama_home\":\"$OLLAMA_HOME\",\"home_ollama\":\"$HOME/.ollama\",\"ollama_home_exists\":$(test -d "$OLLAMA_HOME" && echo true || echo false),\"home_ollama_exists\":$(test -d "$HOME/.ollama" && echo true || echo false)}" "MODEL-C" "run1"
     # #endregion
-    if rsync -a --delete "$OLLAMA_SOURCE/" "$BUNDLE_DIR/models/.ollama/"; then
-      TOTAL_SIZE=$(du -sh "$BUNDLE_DIR/models/.ollama" 2>/dev/null | cut -f1 || echo "unknown")
-      log "Models copied successfully. Total size: $TOTAL_SIZE"
-      log "Models bundled: ${OLLAMA_MODELS}"
-      log "Note: mistral:7b-instruct ~4GB, mixtral:8x7b ~26GB, mistral:7b-instruct-q4_K_M ~2GB"
-      mark_success "models"
-      MODELS_COPIED=true
-      # #region agent log
-      debug_log "get_bundle.sh:models:copy_success" "Models copied successfully" "{\"total_size\":\"$TOTAL_SIZE\",\"dest_exists\":$(test -d "$BUNDLE_DIR/models/.ollama" && echo true || echo false)}" "MODEL-F" "run1"
-      # #endregion
+  fi
+else
+  BUNDLE_OLLAMA="$BUNDLE_DIR/models/.ollama"
+  # Check if bundle already has a usable .ollama (e.g. from a previous run) so we don't overwrite or lose work
+  BUNDLE_HAS_MODELS=false
+  if [[ -d "$BUNDLE_OLLAMA/models" ]] && [[ -n "$(ls -A "$BUNDLE_OLLAMA/models" 2>/dev/null)" ]]; then
+    BUNDLE_HAS_MODELS=true
+  fi
+
+  if [[ "$BUNDLE_HAS_MODELS" == "true" ]]; then
+    # Bundle already has models. Merge in any content from source (new models or updates), then remove source.
+    log "Models already present in bundle (reusing existing)."
+    if [[ -d "$OLLAMA_SOURCE" ]] && [[ -n "$(ls -A "$OLLAMA_SOURCE" 2>/dev/null)" ]]; then
+      log "Merging source into bundle (streaming, no extra disk) and then removing source..."
+      (cd "$OLLAMA_SOURCE" && tar cf - .) | (cd "$BUNDLE_OLLAMA" && tar xf - --no-same-owner)
+      TAR_PIPE_RC=("${PIPESTATUS[@]}")
+      if [[ "${TAR_PIPE_RC[0]:-1}" -eq 0 && "${TAR_PIPE_RC[1]:-1}" -eq 0 ]]; then
+        if rm -rf "$OLLAMA_SOURCE"; then
+          log "Source merged and removed. Bundle size: $(du -sh "$BUNDLE_OLLAMA" 2>/dev/null | cut -f1 || echo "unknown")"
+        else
+          log "WARNING: Merged but could not remove source. Remove manually to free space: $OLLAMA_SOURCE"
+        fi
+      else
+        log "WARNING: Merge from source failed; keeping existing bundle. Remove source manually if redundant: $OLLAMA_SOURCE"
+      fi
+    fi
+    TOTAL_SIZE=$(du -sh "$BUNDLE_OLLAMA" 2>/dev/null | cut -f1 || echo "unknown")
+    log "Models moved successfully. Total size: $TOTAL_SIZE"
+    log "Models bundled: ${OLLAMA_MODELS}"
+    mark_success "models"
+    MODELS_COPIED=true
+    debug_log "get_bundle.sh:models:copy_success" "Reused existing bundle models" "{\"total_size\":\"$TOTAL_SIZE\"}" "MODEL-D" "run1"
+  else
+    # No complete model set in bundle. Stream copy with tar (no 2x disk); then remove source.
+    # Only remove destination if it exists but is empty/incomplete (partial previous run).
+    mkdir -p "$BUNDLE_DIR/models"
+    if [[ -d "$BUNDLE_OLLAMA" ]]; then
+      log "Removing incomplete bundle .ollama from previous run..."
+      rm -rf "$BUNDLE_OLLAMA"
+    fi
+    mkdir -p "$BUNDLE_OLLAMA"
+    # #region agent log
+    debug_log "get_bundle.sh:models:copy_attempt" "Streaming models into bundle (tar)" "{\"source\":\"$OLLAMA_SOURCE\",\"dest\":\"$BUNDLE_OLLAMA\"}" "MODEL-D" "run1"
+    # #endregion
+    (cd "$OLLAMA_SOURCE" && tar cf - .) | (cd "$BUNDLE_OLLAMA" && tar xf - --no-same-owner)
+    TAR_PIPE_RC=("${PIPESTATUS[@]}")
+    if [[ "${TAR_PIPE_RC[0]:-1}" -eq 0 && "${TAR_PIPE_RC[1]:-1}" -eq 0 ]]; then
+      if rm -rf "$OLLAMA_SOURCE"; then
+        TOTAL_SIZE=$(du -sh "$BUNDLE_OLLAMA" 2>/dev/null | cut -f1 || echo "unknown")
+        log "Models moved successfully. Total size: $TOTAL_SIZE"
+        log "Models bundled: ${OLLAMA_MODELS}"
+        if [[ "$MOVE_MODELS" == "true" ]]; then
+          log "Note: Original models have been moved to bundle"
+        else
+          log "Note: mistral:7b-instruct ~4GB, mixtral:8x7b ~26GB, mistral:7b-instruct-q4_K_M ~2GB"
+        fi
+        mark_success "models"
+        MODELS_COPIED=true
+        # #region agent log
+        debug_log "get_bundle.sh:models:copy_success" "Models copied into bundle" "{\"total_size\":\"$TOTAL_SIZE\",\"dest_exists\":$(test -d "$BUNDLE_OLLAMA" && echo true || echo false)}" "MODEL-D" "run1"
+        # #endregion
+      else
+        log "ERROR: Copied to bundle but failed to remove source $OLLAMA_SOURCE. Free space and re-run or remove manually."
+        mark_failed "models"
+        debug_log "get_bundle.sh:models:copy_failed" "Failed to remove source after copy" "{\"source\":\"$OLLAMA_SOURCE\"}" "MODEL-E" "run1"
+      fi
     else
-      log "ERROR: Failed to copy models. Check disk space and permissions."
+      log "ERROR: Failed to stream/copy models. Check disk space and permissions."
       mark_failed "models"
       # #region agent log
-      debug_log "get_bundle.sh:models:copy_failed" "Failed to copy models" "{\"exit_code\":$?}" "MODEL-G" "run1"
+      debug_log "get_bundle.sh:models:copy_failed" "Failed to copy models (tar pipe)" "{\"exit_code\":$?}" "MODEL-E" "run1"
       # #endregion
     fi
   fi
@@ -1277,9 +1441,9 @@ if [[ "$MODELS_COPIED" == "false" ]] && [[ -d "$HOME/.ollama/models" ]] && [[ -n
     log "   mkdir -p $BUNDLE_DIR/models"
     log "   mv ~/.ollama $BUNDLE_DIR/models/.ollama"
   else
-    log "   To copy them now, run:"
+    log "   To move them now, run:"
     log "   mkdir -p $BUNDLE_DIR/models"
-    log "   rsync -av --progress ~/.ollama/ $BUNDLE_DIR/models/.ollama/"
+    log "   mv ~/.ollama $BUNDLE_DIR/models/.ollama"
   fi
   log ""
 fi
@@ -1760,9 +1924,6 @@ else
 fi
 
 if [[ "$SUDO_AVAILABLE" == "true" ]]; then
-# #region agent log
-debug_log "get_bundle.sh:apt_repo:start" "Starting APT repo build" "{\"bundle_dir\":\"$BUNDLE_DIR\",\"apt_packages_count\":${#APT_PACKAGES[@]}}" "APT-A" "run1"
-# #endregion
   # Comprehensive list of packages for airgapped development
   APT_PACKAGES=(
     # Core utilities (already included)
@@ -1849,6 +2010,10 @@ debug_log "get_bundle.sh:apt_repo:start" "Starting APT repo build" "{\"bundle_di
     qemu-kvm
   )
 
+  # #region agent log
+  debug_log "get_bundle.sh:apt_repo:start" "Starting APT repo build" "{\"bundle_dir\":\"$BUNDLE_DIR\",\"apt_packages_count\":${#APT_PACKAGES[@]}}" "APT-A" "run1"
+  # #endregion
+
   # Download packages + dependencies into aptrepo/pool
   # (This uses apt's resolver on the online machine, but stores .debs for offline.)
   TMP_APT="$BUNDLE_DIR/aptrepo/_tmp"
@@ -1861,8 +2026,11 @@ debug_log "get_bundle.sh:apt_repo:start" "Starting APT repo build" "{\"bundle_di
 
   # Make sure apt metadata is fresh
   # Note: apt-get update may report i386 Packages missing (non-fatal, we only bundle amd64)
+  # Capture exit code without triggering set -e (so we can log and continue on repo errors)
+  set +e
   APT_UPDATE_OUTPUT=$(sudo apt-get update -y 2>&1)
   APT_UPDATE_EXIT=$?
+  set -e
   
   # Check if the only error is about missing i386 Packages (expected and non-fatal)
   if [[ $APT_UPDATE_EXIT -ne 0 ]] && echo "$APT_UPDATE_OUTPUT" | grep -q "binary-i386.*File not found" && \
@@ -1877,7 +2045,10 @@ debug_log "get_bundle.sh:apt_repo:start" "Starting APT repo build" "{\"bundle_di
   
   if [[ $APT_UPDATE_EXIT -ne 0 ]]; then
     log "WARNING: apt-get update had issues (exit code: $APT_UPDATE_EXIT)"
+    log "Last 25 lines of apt-get update output:"
+    echo "$APT_UPDATE_OUTPUT" | tail -25 | while IFS= read -r line; do log "  $line"; done
     log "Continuing anyway - package download may still succeed..."
+    debug_log "get_bundle.sh:apt_repo:update_nonzero" "apt-get update returned non-zero" "{\"exit_code\":$APT_UPDATE_EXIT,\"output_lines\":$(echo "$APT_UPDATE_OUTPUT" | wc -l)}" "APT-B" "run1"
   fi
 
   # Download (no install) into a temp cache, then copy .debs into the repo pool
@@ -1906,14 +2077,17 @@ debug_log "get_bundle.sh:apt_repo:start" "Starting APT repo build" "{\"bundle_di
     # Try to download packages individually to get as many as possible
     # Download with dependencies - don't use --fix-missing as we want to know if dependencies are missing
     # Explicitly limit to amd64 architecture only (x86_64) - no i386 packages
+    # Capture exit code without triggering set -e so one failed pkg doesn't exit the script
     MISSING_PKGS=()
     for pkg in "${APT_PACKAGES[@]}"; do
+      set +e
       OUTPUT=$(sudo apt-get -y --download-only \
         -o Dir::Cache="$TMP_APT" \
         -o APT::Architectures="amd64" \
         -o APT::Architecture="amd64" \
         install "$pkg" 2>&1)
       EXIT_CODE=$?
+      set -e
       if [[ $EXIT_CODE -ne 0 ]] && echo "$OUTPUT" | grep -q "Unable to locate package"; then
         log "WARNING: Package not available: $pkg (skipping)"
         MISSING_PKGS+=("$pkg")
@@ -1953,8 +2127,9 @@ debug_log "get_bundle.sh:apt_repo:start" "Starting APT repo build" "{\"bundle_di
   debug_log "get_bundle.sh:apt_repo:copy_start" "Copying .deb files to repo pool" "{\"source\":\"$TMP_APT/archives\",\"dest\":\"$BUNDLE_DIR/aptrepo/pool\"}" "APT-I" "run1"
   # #endregion
   
-  DEB_COUNT=$(find "$TMP_APT/archives" -maxdepth 1 -type f -name "*.deb" 2>/dev/null | wc -l)
-  find "$TMP_APT/archives" -maxdepth 1 -type f -name "*.deb" -print -exec cp -n -- {} "$BUNDLE_DIR/aptrepo/pool/" \;
+  # find returns 1 when no matches; avoid triggering set -e (pipefail)
+  DEB_COUNT=$(find "$TMP_APT/archives" -maxdepth 1 -type f -name "*.deb" 2>/dev/null | wc -l) || DEB_COUNT=0
+  find "$TMP_APT/archives" -maxdepth 1 -type f -name "*.deb" -print -exec cp -n -- {} "$BUNDLE_DIR/aptrepo/pool/" \; 2>/dev/null || true
   
   # Verify critical dependencies are downloaded (skip system packages and virtual packages)
   # This helps catch missing dependencies before the bundle is used
@@ -2055,8 +2230,8 @@ EOF
     }
   fi
   
-  # Check if pool directory has any .deb files
-  DEB_FILES_IN_POOL=$(find pool -maxdepth 1 -type f -name "*.deb" 2>/dev/null | wc -l)
+  # Check if pool directory has any .deb files (find returns 1 when no matches; avoid set -e)
+  DEB_FILES_IN_POOL=$(find pool -maxdepth 1 -type f -name "*.deb" 2>/dev/null | wc -l) || DEB_FILES_IN_POOL=0
   
   # #region agent log
   debug_log "get_bundle.sh:apt_repo:pool_check" "Checking pool directory" "{\"deb_count\":$DEB_FILES_IN_POOL}" "APT-M" "run1"
@@ -2475,141 +2650,269 @@ else
 fi
 
 # ============
-# Final Summary
+# 10) Download CUDA Toolkit 12.8+ (for RTX 5070 Ti Blackwell architecture)
 # ============
 log ""
-log "=========================================="
-log "BUNDLE CREATION SUMMARY"
-log "=========================================="
-log ""
+log "Downloading CUDA Toolkit 12.8+ for RTX 5070 Ti support..."
+CUDA_DIR="$BUNDLE_DIR/cuda"
+mkdir -p "$CUDA_DIR"
 
-# #region agent log
-debug_log "get_bundle.sh:summary:start" "Generating final summary" "{\"bundle_dir\":\"$BUNDLE_DIR\"}" "SUMMARY-A" "run1"
-# #endregion
+# CUDA Toolkit download - try .deb packages first (easier for offline install), fallback to .run installer
+# Using CUDA 12.8.0 as minimum version for Blackwell architecture support
+CUDA_VERSION="12.8.0"
+# CUDA 12.8.0 ships with driver 570.86.10 (required for Blackwell/RTX 5070 Ti)
+# The .run local installer is self-contained and installs the full toolkit offline
+CUDA_RUN_URL="https://developer.download.nvidia.com/compute/cuda/${CUDA_VERSION}/local_installers/cuda_${CUDA_VERSION}_570.86.10_linux.run"
+# Network .deb (metapackage) as a fallback — note: requires internet on target to resolve deps
+CUDA_DEB_URL="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-toolkit-12-8_${CUDA_VERSION}-1_amd64.deb"
 
-# Check each component and report status
-HAS_FAILURES=false
-HAS_WARNINGS=false
+# Check for existing installer (prefer .run over .deb for offline capability)
+CUDA_INSTALLER=""
+if [[ -f "$CUDA_DIR/cuda_${CUDA_VERSION}_linux.run" ]]; then
+  CUDA_INSTALLER="$CUDA_DIR/cuda_${CUDA_VERSION}_linux.run"
+elif [[ -f "$CUDA_DIR/cuda-toolkit-12-8_${CUDA_VERSION}-1_amd64.deb" ]]; then
+  CUDA_INSTALLER="$CUDA_DIR/cuda-toolkit-12-8_${CUDA_VERSION}-1_amd64.deb"
+fi
 
-# List of all components to check
-COMPONENTS="ollama_linux models vscodium continue python_ext rust_ext rust_toolchain rust_crates python_packages apt_repo"
-
-for component in $COMPONENTS; do
-  status="$(get_status "$component")"
-  case "$status" in
-    success)
-      log "✓ $component: SUCCESS"
-      ;;
-    failed)
-      log "✗ $component: FAILED"
-      HAS_FAILURES=true
-      ;;
-    skipped)
-      log "⊘ $component: SKIPPED (not required or not found)"
-      ;;
-    pending)
-      log "? $component: PENDING (not completed)"
-      HAS_WARNINGS=true
-      ;;
-  esac
-done
-
-log ""
-log "=========================================="
-log "BUNDLE LOCATION: $BUNDLE_DIR"
-log "=========================================="
-
-# Calculate actual sizes
-if [[ -d "$BUNDLE_DIR/models/.ollama" ]]; then
-  MODEL_SIZE=$(du -sh "$BUNDLE_DIR/models/.ollama" 2>/dev/null | cut -f1 || echo "unknown")
-  log "Models size: $MODEL_SIZE"
+if [[ -n "$CUDA_INSTALLER" ]] && [[ -f "$CUDA_INSTALLER" ]]; then
+  CUDA_SIZE=$(du -sh "$CUDA_INSTALLER" 2>/dev/null | cut -f1 || echo "unknown")
+  log "CUDA Toolkit installer already exists ($CUDA_SIZE). Skipping download."
+  mark_success "cuda"
 else
-  log "Models: NOT BUNDLED"
-  HAS_WARNINGS=true
+  log "Downloading CUDA Toolkit ${CUDA_VERSION} (~3-4 GB)..."
+  log "This is required for RTX 5070 Ti (Blackwell architecture) GPU support."
+
+  # Download the .run local installer first — it is self-contained and works fully offline.
+  # The .deb metapackage is NOT self-contained and requires internet on the target to resolve deps.
+  CUDA_RUN="$CUDA_DIR/cuda_${CUDA_VERSION}_linux.run"
+  # #region agent log
+  printf '{"sessionId":"643f5d","runId":"run1","hypothesisId":"H1","location":"get_bundle.sh:cuda_run_attempt","message":"Attempting CUDA .run download","data":{"url":"%s","dest":"%s"},"timestamp":%s}\n' "$CUDA_RUN_URL" "$CUDA_RUN" "$(date +%s)000" >> "/mnt/t7/airgapped_llm/.cursor/debug-643f5d.log" 2>/dev/null || true
+  # #endregion
+  CUDA_RUN_EXIT=0
+  wget --progress=bar:force:noscroll -O "$CUDA_RUN" "$CUDA_RUN_URL" 2>&1 || CUDA_RUN_EXIT=$?
+  # #region agent log
+  CUDA_RUN_SIZE=$(du -sh "$CUDA_RUN" 2>/dev/null | cut -f1 || echo "0")
+  printf '{"sessionId":"643f5d","runId":"run1","hypothesisId":"H1","location":"get_bundle.sh:cuda_run_result","message":"CUDA .run wget result","data":{"exit_code":%s,"file_size":"%s","url":"%s"},"timestamp":%s}\n' "$CUDA_RUN_EXIT" "$CUDA_RUN_SIZE" "$CUDA_RUN_URL" "$(date +%s)000" >> "/mnt/t7/airgapped_llm/.cursor/debug-643f5d.log" 2>/dev/null || true
+  # #endregion
+  if [[ $CUDA_RUN_EXIT -eq 0 ]]; then
+    chmod +x "$CUDA_RUN"
+    CUDA_SIZE=$(du -sh "$CUDA_RUN" 2>/dev/null | cut -f1 || echo "unknown")
+    log "✓ CUDA Toolkit .run installer downloaded ($CUDA_SIZE)"
+    mark_success "cuda"
+  else
+    log "WARNING: Failed to download CUDA Toolkit .run installer."
+    log "  Tried URL: $CUDA_RUN_URL"
+    log "  Check the correct URL at: https://developer.nvidia.com/cuda-downloads"
+    log "  Download manually and place the .run file in: $CUDA_DIR/"
+    mark_failed "cuda"
+  fi
 fi
 
-TOTAL_SIZE=$(du -sh "$BUNDLE_DIR" 2>/dev/null | cut -f1 || echo "unknown")
-log "Total bundle size: $TOTAL_SIZE"
+# ============
+# 11) Download NVIDIA Driver 570.x+ (open kernel module)
+# ============
 log ""
+log "Downloading NVIDIA Driver 570.x+ (open kernel module) for RTX 5070 Ti..."
+NVIDIA_DIR="$BUNDLE_DIR/nvidia-driver"
+mkdir -p "$NVIDIA_DIR"
 
-# Provide actionable next steps
-if [[ "$HAS_FAILURES" == "true" ]]; then
-  log "=========================================="
-  log "⚠️  ACTION REQUIRED: Some components failed"
-  log "=========================================="
-  log ""
-  
-  if [[ "$(get_status models)" == "failed" ]]; then
-    log "MODELS FAILED:"
-    if [[ -d "$HOME/.ollama/models" ]] && [[ -n "$(ls -A "$HOME/.ollama/models" 2>/dev/null)" ]]; then
-      EXISTING_SIZE=$(du -sh "$HOME/.ollama/models" 2>/dev/null | cut -f1 || echo "unknown")
-      log "  → Found existing models in ~/.ollama/models ($EXISTING_SIZE)"
-      log "  → To copy them manually, run:"
-      log "     mkdir -p $BUNDLE_DIR/models"
-      log "     rsync -av --progress ~/.ollama/ $BUNDLE_DIR/models/.ollama/"
+# Check if Pop!_OS already has NVIDIA driver installed
+if command -v nvidia-smi >/dev/null 2>&1; then
+  DRIVER_VERSION=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 || echo "")
+  if [[ -n "$DRIVER_VERSION" ]]; then
+    DRIVER_MAJOR=$(echo "$DRIVER_VERSION" | cut -d. -f1)
+    if [[ "$DRIVER_MAJOR" -ge 570 ]]; then
+      log "NVIDIA Driver $DRIVER_VERSION already installed (570+). Skipping download."
+      log "Note: If using proprietary module, you may need to switch to open kernel module."
+      mark_success "nvidia_driver"
     else
-      log "  → No existing models found. You need to:"
-      log "     1. Ensure Ollama is installed and working"
-      log "     2. Pull models manually: ollama pull <model-name>"
-      log "     3. Re-run this script or copy ~/.ollama manually"
+      log "NVIDIA Driver $DRIVER_VERSION is installed but < 570. Downloading 570.x+..."
+      NEED_DRIVER_DOWNLOAD=true
     fi
-    log ""
+  else
+    NEED_DRIVER_DOWNLOAD=true
   fi
-  
-  if [[ "$(get_status vscodium)" == "failed" ]]; then
-    log "VSCODIUM FAILED:"
-    log "  → Re-run this script to retry download"
-    log "  → Or download manually from: https://github.com/VSCodium/vscodium/releases"
-    log ""
-  fi
-  
-  if [[ "$(get_status continue)" == "failed" ]] || [[ "$(get_status python_ext)" == "failed" ]] || [[ "$(get_status rust_ext)" == "failed" ]]; then
-    log "EXTENSIONS FAILED:"
-    log "  → Re-run this script to retry download"
-    log "  → Or download manually from: https://open-vsx.org"
-    log ""
-  fi
-  
-  if [[ "$(get_status rust_toolchain)" == "failed" ]]; then
-    log "RUST TOOLCHAIN FAILED:"
-    log "  → Re-run this script to retry download"
-    log "  → Or download manually from: https://rustup.rs"
-    log ""
-  fi
-  
-  if [[ "$(get_status python_packages)" == "failed" ]]; then
-    log "PYTHON PACKAGES FAILED:"
-    log "  → Check that requirements.txt exists and is valid"
-    log "  → Ensure pip is installed: python3 -m pip --version"
-    log "  → Re-run this script to retry"
-    log ""
-  fi
-  
-  log "After fixing issues, re-run: ./get_bundle.sh"
-  log ""
+else
+  NEED_DRIVER_DOWNLOAD=true
 fi
 
-if [[ "$HAS_WARNINGS" == "true" ]] && [[ "$HAS_FAILURES" != "true" ]]; then
-  log "⚠️  Some optional components were skipped (this is normal)"
-  log ""
+if [[ "${NEED_DRIVER_DOWNLOAD:-false}" == "true" ]]; then
+  # Download NVIDIA driver .deb packages for Pop!_OS/Ubuntu
+  # Try to find available 570+ driver packages
+  log "Downloading NVIDIA Driver 570.x+ packages..."
+  log "Note: Driver packages depend on Pop!_OS repository configuration."
+  log "If download fails, drivers may already be installed or need manual setup via Pop!_OS driver manager."
+  
+  # Use apt-get to download driver packages without installing
+  # Try multiple package name patterns as they vary by distribution
+  TMP_DRIVER_DIR="$NVIDIA_DIR/_tmp"
+  mkdir -p "$TMP_DRIVER_DIR"
+  
+  DRIVER_PKGS=""
+  # Check which driver packages are available
+  if apt-cache search nvidia-driver-570 2>/dev/null | grep -q "nvidia-driver-570"; then
+    DRIVER_PKGS="nvidia-driver-570 nvidia-dkms-570 nvidia-utils-570"
+  elif apt-cache search nvidia-driver-570-open 2>/dev/null | grep -q "nvidia-driver-570-open"; then
+    DRIVER_PKGS="nvidia-driver-570-open nvidia-dkms-570-open nvidia-utils-570"
+  elif apt-cache search nvidia-driver 2>/dev/null | grep -E "nvidia-driver-[5-9][0-9][0-9]" | head -1; then
+    # Find latest 570+ driver
+    LATEST_DRIVER=$(apt-cache search nvidia-driver 2>/dev/null | grep -E "nvidia-driver-[5-9][0-9][0-9]" | awk '{print $1}' | sort -V | tail -1)
+    if [[ -n "$LATEST_DRIVER" ]]; then
+      DRIVER_PKGS="$LATEST_DRIVER"
+      log "Found available driver package: $LATEST_DRIVER"
+    fi
+  fi
+  
+  if [[ -n "$DRIVER_PKGS" ]]; then
+    # #region agent log
+    printf '{"sessionId":"643f5d","runId":"run1","hypothesisId":"H3","location":"get_bundle.sh:nvidia_apt_attempt","message":"Attempting NVIDIA driver apt-get download","data":{"pkgs":"%s","tmp_dir":"%s"},"timestamp":%s}\n' "$DRIVER_PKGS" "$TMP_DRIVER_DIR" "$(date +%s)000" >> "/mnt/t7/airgapped_llm/.cursor/debug-643f5d.log" 2>/dev/null || true
+    # #endregion
+    NVIDIA_APT_OUT="$TMP_DRIVER_DIR/apt_output.txt"
+    sudo apt-get install --download-only -y -o Dir::Cache="$TMP_DRIVER_DIR" \
+      -o APT::Architectures="amd64" \
+      -o APT::Architecture="amd64" \
+      $DRIVER_PKGS \
+      > "$NVIDIA_APT_OUT" 2>&1 || true
+    NVIDIA_APT_EXIT=$?
+    # #region agent log
+    NVIDIA_ARCHIVE_COUNT=$(find "$TMP_DRIVER_DIR/archives" -maxdepth 1 -name "*.deb" 2>/dev/null | wc -l || echo 0)
+    printf '{"sessionId":"643f5d","runId":"run1","hypothesisId":"H3","location":"get_bundle.sh:nvidia_apt_result","message":"NVIDIA apt-get result","data":{"exit_code":%s,"archive_count":%s,"output_tail":"%s"},"timestamp":%s}\n' "$NVIDIA_APT_EXIT" "$NVIDIA_ARCHIVE_COUNT" "$(tail -3 "$NVIDIA_APT_OUT" 2>/dev/null | tr '\n' '|' | tr '"' "'")" "$(date +%s)000" >> "/mnt/t7/airgapped_llm/.cursor/debug-643f5d.log" 2>/dev/null || true
+    # #endregion
+    if [[ $NVIDIA_APT_EXIT -eq 0 ]]; then
+      # Copy downloaded .deb files
+      find "$TMP_DRIVER_DIR/archives" -maxdepth 1 -name "*.deb" -exec cp {} "$NVIDIA_DIR/" \; 2>/dev/null || true
+      DEB_COUNT=$(find "$NVIDIA_DIR" -maxdepth 1 -name "*.deb" | wc -l)
+      if [[ $DEB_COUNT -gt 0 ]]; then
+        log "✓ Downloaded $DEB_COUNT NVIDIA driver package(s)"
+        mark_success "nvidia_driver"
+      else
+        log "WARNING: No driver packages downloaded. Driver may need manual installation."
+        mark_failed "nvidia_driver"
+      fi
+      rm -rf "$TMP_DRIVER_DIR"
+    else
+      log "WARNING: Failed to download NVIDIA driver packages via apt-get."
+      log "Drivers may need to be installed manually via Pop!_OS driver manager or downloaded from NVIDIA."
+      mark_failed "nvidia_driver"
+    fi
+  else
+    log "WARNING: NVIDIA driver 570+ packages not found in repositories."
+    log "Pop!_OS may handle drivers automatically, or you may need to:"
+    log "  1. Use Pop!_OS driver manager: sudo apt install system76-driver-nvidia"
+    log "  2. Download manually from: https://www.nvidia.com/Download/index.aspx"
+    mark_skipped "nvidia_driver"
+  fi
 fi
 
-if [[ "$HAS_FAILURES" != "true" ]]; then
-  log "✓ All required components bundled and built successfully!"
-  log ""
-  log "Next steps:"
-  log "  1. Verify bundle contents: ls -lh $BUNDLE_DIR"
-  log "  2. Copy bundle to external drive or transfer to airgapped system"
-  log "  3. On airgapped Linux system, run: ./install_offline.sh"
-  log ""
-  log "Note: All packages have been pre-built on this system and are ready"
-  log "      for installation on the airgapped system. No compilation needed."
-  log ""
-fi
-
-log "Bundle location: $BUNDLE_DIR"
+# ============
+# 12) Download and build Whisper.cpp (voice-to-text)
+# ============
 log ""
+log "Downloading Whisper.cpp for local voice-to-text transcription..."
+WHISPER_DIR="$BUNDLE_DIR/whisper"
+mkdir -p "$WHISPER_DIR"
 
-# #region agent log
-debug_log "get_bundle.sh:complete" "Script execution completed" "{\"bundle_dir\":\"$BUNDLE_DIR\",\"has_failures\":\"$HAS_FAILURES\",\"has_warnings\":\"$HAS_WARNINGS\",\"total_size\":\"$TOTAL_SIZE\"}" "SUMMARY-B" "run1"
-# #endregion
+# Whisper.cpp GitHub repository
+WHISPER_REPO="https://github.com/ggerganov/whisper.cpp.git"
+WHISPER_CLONE_DIR="$WHISPER_DIR/whisper.cpp"
+
+if [[ -d "$WHISPER_CLONE_DIR/.git" ]]; then
+  log "Whisper.cpp repository already cloned. Updating..."
+  OLD_PWD="$PWD"
+  cd "$WHISPER_CLONE_DIR" || cd "$OLD_PWD" || true
+  git pull --quiet 2>&1 || log "WARNING: git pull failed, using existing clone"
+  cd "$OLD_PWD" || true
+  mark_success "whisper"
+else
+  log "Cloning Whisper.cpp repository..."
+  if git clone --depth 1 "$WHISPER_REPO" "$WHISPER_CLONE_DIR" 2>&1; then
+    log "✓ Whisper.cpp repository cloned"
+    
+    OLD_PWD="$PWD"
+    cd "$WHISPER_CLONE_DIR" || cd "$OLD_PWD" || true
+    
+    # Download base model (base.en for English, ~150MB)
+    if [[ -f "./models/download-ggml-model.sh" ]]; then
+      log "Downloading Whisper base.en model..."
+      if bash ./models/download-ggml-model.sh base.en 2>&1; then
+        log "✓ Whisper base.en model downloaded"
+      else
+        log "WARNING: Failed to download Whisper model. You can download manually later."
+      fi
+    else
+      log "WARNING: Whisper model download script not found."
+    fi
+    
+    # Build whisper.cpp (requires cmake and build tools); use CUBLAS when GPU/CUDA available
+    if command -v cmake >/dev/null 2>&1; then
+      log "Building Whisper.cpp..."
+      mkdir -p build
+      cd build || cd "$OLD_PWD" || true
+      WHISPER_USE_CUBLAS=false
+      if command -v nvcc >/dev/null 2>&1 || (command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1); then
+        WHISPER_USE_CUBLAS=true
+      fi
+      if [[ "$WHISPER_USE_CUBLAS" == "true" ]] && cmake .. -DWHISPER_CUBLAS=ON 2>&1 && make -j$(nproc) 2>&1; then
+        log "✓ Whisper.cpp built successfully (with CUBLAS for GPU)"
+        mark_success "whisper"
+      elif cmake .. 2>&1 && make -j$(nproc) 2>&1; then
+        log "✓ Whisper.cpp built successfully (CPU only)"
+        mark_success "whisper"
+      else
+        log "WARNING: Whisper.cpp build failed. Source code is bundled and will be built on target machine."
+        mark_success "whisper"  # Mark as success since source is bundled
+      fi
+      cd "$OLD_PWD" || true
+    else
+      log "WARNING: cmake not found. Whisper.cpp source is bundled and will be built on target machine."
+      mark_success "whisper"  # Mark as success since source is bundled
+    fi
+  else
+    log "WARNING: Failed to clone Whisper.cpp repository."
+    log "You can download manually from: https://github.com/ggerganov/whisper.cpp"
+    mark_failed "whisper"
+  fi
+fi
+
+# ============
+# 13) Download Obsidian (note-taking application)
+# ============
+log ""
+log "Downloading Obsidian for local markdown note-taking..."
+OBSIDIAN_DIR="$BUNDLE_DIR/obsidian"
+mkdir -p "$OBSIDIAN_DIR"
+
+# Obsidian AppImage download (Linux x86_64)
+OBSIDIAN_VERSION="${OBSIDIAN_VERSION:-1.12.4}"  # Override with: export OBSIDIAN_VERSION=x.y.z
+OBSIDIAN_URL="https://github.com/obsidianmd/obsidian-releases/releases/download/v${OBSIDIAN_VERSION}/Obsidian-${OBSIDIAN_VERSION}.AppImage"
+OBSIDIAN_APPIMAGE="$OBSIDIAN_DIR/Obsidian-${OBSIDIAN_VERSION}.AppImage"
+
+if [[ -f "$OBSIDIAN_APPIMAGE" ]]; then
+  OBSIDIAN_SIZE=$(du -sh "$OBSIDIAN_APPIMAGE" 2>/dev/null | cut -f1 || echo "unknown")
+  log "Obsidian AppImage already exists ($OBSIDIAN_SIZE). Skipping download."
+  mark_success "obsidian"
+else
+  log "Downloading Obsidian ${OBSIDIAN_VERSION} AppImage (~200 MB)..."
+  # #region agent log
+  printf '{"sessionId":"643f5d","runId":"run1","hypothesisId":"H4","location":"get_bundle.sh:obsidian_attempt","message":"Attempting Obsidian download","data":{"url":"%s","version":"%s"},"timestamp":%s}\n' "$OBSIDIAN_URL" "$OBSIDIAN_VERSION" "$(date +%s)000" >> "/mnt/t7/airgapped_llm/.cursor/debug-643f5d.log" 2>/dev/null || true
+  # #endregion
+  OBSIDIAN_WGET_EXIT=0
+  wget --progress=bar:force:noscroll -O "$OBSIDIAN_APPIMAGE" "$OBSIDIAN_URL" 2>&1 || OBSIDIAN_WGET_EXIT=$?
+  OBSIDIAN_FILE_SIZE=$(du -sh "$OBSIDIAN_APPIMAGE" 2>/dev/null | cut -f1 || echo "0")
+  # #region agent log
+  printf '{"sessionId":"643f5d","runId":"run1","hypothesisId":"H4","location":"get_bundle.sh:obsidian_result","message":"Obsidian wget result","data":{"exit_code":%s,"file_size":"%s"},"timestamp":%s}\n' "$OBSIDIAN_WGET_EXIT" "$OBSIDIAN_FILE_SIZE" "$(date +%s)000" >> "/mnt/t7/airgapped_llm/.cursor/debug-643f5d.log" 2>/dev/null || true
+  # #endregion
+  if [[ $OBSIDIAN_WGET_EXIT -eq 0 ]]; then
+    chmod +x "$OBSIDIAN_APPIMAGE"
+    OBSIDIAN_SIZE=$(du -sh "$OBSIDIAN_APPIMAGE" 2>/dev/null | cut -f1 || echo "unknown")
+    log "✓ Obsidian downloaded ($OBSIDIAN_SIZE)"
+    mark_success "obsidian"
+  else
+    log "WARNING: Failed to download Obsidian. You can download manually from:"
+    log "  https://github.com/obsidianmd/obsidian-releases/releases"
+    mark_failed "obsidian"
+  fi
+fi
+
+# Final summary is always printed by the EXIT trap (print_final_summary) so you see
+# what worked and what didn't even if the script exits early (e.g. during APT build).

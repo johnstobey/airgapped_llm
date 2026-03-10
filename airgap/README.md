@@ -21,11 +21,14 @@ Creates the airgap bundle containing:
 - VSCodium (code editor)
 - Continue extension (AI coding assistant)
 - Python and Rust extensions
-- System libraries (APT repo) - **built on online system**
+- System libraries (APT repo) - **built on online system**, includes rsync, QEMU/KVM
 - Python packages - **pre-built as wheels**
 - Rust toolchain
 - Rust crates - **vendored for offline builds**
 - AI models (Mistral, Mixtral)
+- CUDA Toolkit and NVIDIA driver (optional; when bundled, driver install may require reboot on target)
+- Whisper.cpp (voice-to-text) - **built from source**; CUBLAS build used when GPU/CUDA is available on bundle machine
+- Obsidian (note-taking) - **AppImage**
 
 **Requirements**: Must be run on **Pop!_OS/Ubuntu/Debian Linux** with internet access.
 
@@ -138,19 +141,34 @@ Installs the following components:
 - Rust toolchain - **installed via bundled rustup-init**
 - Rust crates - **vendored dependencies for offline builds**
 - Python packages - **pre-built wheels, no compilation**
+- CUDA Toolkit (optional, from bundle) - **.run or .deb installer**
+- NVIDIA driver (optional, from bundle) - **.deb packages; may require reboot**
+- Whisper.cpp (voice-to-text) - **built from bundle source; CUBLAS used when GPU is available**
+- Obsidian (note-taking) - **AppImage from bundle**
+- QEMU/KVM (optional, from APT repo) - **qemu-system-x86, qemu-utils, qemu-kvm**
 
 **Usage:**
 
 ```bash
-# setup passwordless sudo
-cd /path/to/airgap_llm # --skip-verification --allow-network
+# From the airgap directory (bundle present in ./airgap_bundle or BUNDLE_DIR)
 ./install_offline.sh
+# Optional: ./install_offline.sh --skip-verification --allow-network
 ```
 
 **Options:**
 
 - `--skip-verification` - Skip SHA256 verification of artifacts. If files already exist, accept them without verification. Useful when re-running the script and you trust existing files.
 - `--allow-network` - Allow installation even if a network connection is detected. This overrides the airgap requirement check.
+- `--resume` - **Post-reboot resume.** Run after rebooting when the NVIDIA driver was just installed. Runs verification and configures Ollama for GPU use. Do not use for a full install.
+
+**NVIDIA driver and reboot**
+
+If the installer installs NVIDIA driver packages from the bundle, the driver will not be active until the system is rebooted. The script will:
+
+1. Print **"REBOOT REQUIRED (NVIDIA driver)"** and skip post-install verification (since `nvidia-smi` will not work yet).
+2. Tell you to run `sudo reboot`, then after reboot run: `./install_offline.sh --resume`.
+
+When you run with `--resume` after reboot, the script will run `verify_install.sh`, add `OLLAMA_NUM_GPU=1` to your shell profile if the GPU is available, and remove the pending-reboot state file. No other install steps are run in `--resume` mode.
 
 **Environment Variables:**
 

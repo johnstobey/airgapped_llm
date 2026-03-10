@@ -64,6 +64,10 @@ if [[ -z "${BUNDLE_DIR:-}" ]]; then
 fi
 INSTALL_PREFIX="${INSTALL_PREFIX:-/usr/local/bin}"
 
+# When run with sudo, use the invoking user's home for user-writable paths (Obsidian, models, extensions, etc.)
+TARGET_USER="${SUDO_USER:-$USER}"
+TARGET_HOME=$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6 || echo "${HOME:-/root}")
+
 METADATA_DIR="$BUNDLE_DIR/metadata"
 BUNDLE_OS_RELEASE="$METADATA_DIR/os-release"
 APT_REPO_OS_MISMATCH="false"
@@ -86,6 +90,7 @@ fi
 # ============
 SKIP_VERIFICATION="${SKIP_VERIFICATION:-false}"
 ALLOW_NETWORK="${ALLOW_NETWORK:-false}"
+RESUME_MODE="${RESUME_MODE:-false}"
 while [[ $# -gt 0 ]]; do
   case $1 in
     --skip-verification)
@@ -96,19 +101,25 @@ while [[ $# -gt 0 ]]; do
       ALLOW_NETWORK="true"
       shift
       ;;
+    --resume)
+      RESUME_MODE="true"
+      shift
+      ;;
     --help|-h)
-      echo "Usage: $0 [--skip-verification] [--allow-network]"
+      echo "Usage: $0 [--skip-verification] [--allow-network] [--resume]"
       echo ""
       echo "Options:"
       echo "  --skip-verification    Skip SHA256 verification of artifacts. If files exist,"
       echo "                        accept them without verification."
       echo "  --allow-network        Allow installation even if network connection is detected."
       echo "                        (Overrides airgap requirement check)"
+      echo "  --resume               Post-reboot resume: run verification and complete GPU setup"
+      echo "                        after rebooting when NVIDIA driver was just installed."
       echo "  --help, -h             Show this help message"
       echo ""
       echo "Environment Variables:"
       echo "  BUNDLE_DIR            Bundle directory location (default: ./airgap_bundle)"
-      echo "  INSTALL_PREFIX        Installation prefix for Ollama (default: /usr/local/bin)"
+      echo "  INSTALL_PREFIX         Installation prefix for Ollama (default: /usr/local/bin)"
       echo "  SKIP_VERIFICATION     Set to 'true' to skip verification (same as --skip-verification flag)"
       echo "  ALLOW_NETWORK         Set to 'true' to allow network (same as --allow-network flag)"
       exit 0
@@ -207,6 +218,13 @@ STATUS_models=""
 STATUS_extensions=""
 STATUS_rust=""
 STATUS_python=""
+STATUS_cuda=""
+STATUS_nvidia_driver=""
+STATUS_whisper=""
+STATUS_obsidian=""
+
+# Set when NVIDIA driver was just installed and reboot is needed for it to take effect
+INSTALL_NEEDS_REBOOT="${INSTALL_NEEDS_REBOOT:-false}"
 
 # Set up console logging - redirect stdout and stderr to both console and log file
 if [[ -n "$CONSOLE_LOG" ]]; then
@@ -222,6 +240,44 @@ fi
 
 # Log script start
 debug_log "install_offline.sh:start" "Installation script started" "{\"bundle_dir\":\"$BUNDLE_DIR\",\"install_prefix\":\"$INSTALL_PREFIX\",\"os\":\"$OS\",\"user\":\"$USER\",\"pid\":$$}" "INIT-A" "run1"
+
+# ============
+# --resume: post-reboot completion (verification + GPU profile setup)
+# ============
+if [[ "$RESUME_MODE" == "true" ]]; then
+  INSTALL_REBOOT_STATE="$BUNDLE_DIR/.install_needs_reboot"
+  if [[ ! -f "$INSTALL_REBOOT_STATE" ]]; then
+    log "No pending reboot from previous install. Run without --resume for full install."
+    exit 0
+  fi
+  log "Resuming post-reboot (NVIDIA driver was installed; completing setup)..."
+  VERIFY_SCRIPT_RESUME="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/verify_install.sh"
+  if [[ -f "$VERIFY_SCRIPT_RESUME" ]]; then
+    log "Running post-install verification..."
+    bash "$VERIFY_SCRIPT_RESUME" || true
+  fi
+  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+    log "GPU is available. Adding OLLAMA_NUM_GPU=1 to shell profile..."
+    OLLAMA_GPU_SETUP='export OLLAMA_NUM_GPU=1'
+    if ! grep -q "OLLAMA_NUM_GPU" "$HOME/.bashrc" 2>/dev/null && ! grep -q "OLLAMA_NUM_GPU" "$HOME/.zshrc" 2>/dev/null; then
+      if [[ -n "${ZSH_VERSION:-}" ]] || [[ -f "$HOME/.zshrc" ]]; then
+        echo "" >> "$HOME/.zshrc"
+        echo "# Ollama GPU (added by install_offline --resume)" >> "$HOME/.zshrc"
+        echo "$OLLAMA_GPU_SETUP" >> "$HOME/.zshrc"
+      else
+        echo "" >> "$HOME/.bashrc"
+        echo "# Ollama GPU (added by install_offline --resume)" >> "$HOME/.bashrc"
+        echo "$OLLAMA_GPU_SETUP" >> "$HOME/.bashrc"
+      fi
+      log "✓ OLLAMA_NUM_GPU=1 added to profile"
+    fi
+    export OLLAMA_NUM_GPU=1
+  fi
+  rm -f "$INSTALL_REBOOT_STATE"
+  log "Post-reboot steps complete. You can start Ollama and use the GPU."
+  debug_log "install_offline.sh:resume:complete" "Resume completed" "{\"state_file_removed\":true}" "RESUME-A" "run1"
+  exit 0
+fi
 
 if [[ "$APT_REPO_OS_MISMATCH" == "true" ]]; then
   log "WARNING: Bundle was built for a different OS release than this system."
@@ -837,6 +893,9 @@ APT_CONFIG_EOF
     less \
     file \
     zstd \
+    qemu-system-x86 \
+    qemu-utils \
+    qemu-kvm \
     >"$APT_INSTALL_OUTPUT_FILE" 2>&1; then
     APT_INSTALL_EXIT=0
     mark_success "apt_repo"
@@ -1224,14 +1283,15 @@ log "  To monitor logs: tail -f ~/.ollama/logs/server.log"
 # ============
 # 4) Move model data into ~/.ollama
 # ============
-log "Restoring Ollama model directory to \$HOME/.ollama ..."
-debug_log "install_offline.sh:models:start" "Starting model restoration" "{\"source\":\"$BUNDLE_DIR/models/.ollama\",\"dest\":\"$HOME/.ollama\"}" "MODEL-A" "run1"
+log "Restoring Ollama model directory to target user's ~/.ollama ..."
+debug_log "install_offline.sh:models:start" "Starting model restoration" "{\"source\":\"$BUNDLE_DIR/models/.ollama\",\"dest\":\"$TARGET_HOME/.ollama\"}" "MODEL-A" "run1"
 
 if [[ -d "$BUNDLE_DIR/models/.ollama" ]] && [[ -n "$(ls -A "$BUNDLE_DIR/models/.ollama" 2>/dev/null)" ]]; then
-  mkdir -p "$HOME/.ollama"
-  if rsync -a "$BUNDLE_DIR/models/.ollama/" "$HOME/.ollama/" 2>&1; then
-    MODEL_COUNT=$(find "$HOME/.ollama" -name "*.gguf" -o -name "*.bin" 2>/dev/null | wc -l || echo "0")
-    MODEL_SIZE=$(du -sh "$HOME/.ollama" 2>/dev/null | cut -f1 || echo "unknown")
+  mkdir -p "$TARGET_HOME/.ollama"
+  if rsync -a "$BUNDLE_DIR/models/.ollama/" "$TARGET_HOME/.ollama/" 2>&1; then
+    [[ "$(id -u)" -eq 0 ]] && [[ -n "$TARGET_USER" ]] && chown -R "$TARGET_USER:$TARGET_USER" "$TARGET_HOME/.ollama" 2>/dev/null || true
+    MODEL_COUNT=$(find "$TARGET_HOME/.ollama" -name "*.gguf" -o -name "*.bin" 2>/dev/null | wc -l || echo "0")
+    MODEL_SIZE=$(du -sh "$TARGET_HOME/.ollama" 2>/dev/null | cut -f1 || echo "unknown")
     mark_success "models"
     log "✓ Models restored successfully ($MODEL_COUNT models, $MODEL_SIZE)"
     debug_log "install_offline.sh:models:success" "Models restored successfully" "{\"status\":\"success\",\"model_count\":$MODEL_COUNT,\"size\":\"$MODEL_SIZE\"}" "MODEL-A" "run1"
@@ -1252,14 +1312,15 @@ fi
 log "Installing Continue VSIX into VSCodium..."
 debug_log "install_offline.sh:extensions:continue_start" "Starting Continue extension installation" "{\"bundle_dir\":\"$BUNDLE_DIR\"}" "EXT-A" "run1"
 
-# Ensure we have a user directory for VSCodium extensions if running as non-root user
-if [[ $EUID -ne 0 ]]; then
-  mkdir -p "$HOME/.vscode-oss/extensions"
+# Ensure we have a user directory for VSCodium extensions (use target user's home when run with sudo)
+mkdir -p "$TARGET_HOME/.vscode-oss/extensions"
+if [[ "$(id -u)" -eq 0 ]] && [[ -n "$TARGET_USER" ]]; then
+  chown -R "$TARGET_USER:$TARGET_USER" "$TARGET_HOME/.vscode-oss" 2>/dev/null || true
 fi
 
 VSIX_PATH="$(ls -1 "$BUNDLE_DIR"/continue/Continue.continue-*.vsix 2>/dev/null | head -n1)"
 if [[ -n "$VSIX_PATH" ]] && [[ -f "$VSIX_PATH" ]]; then
-  # Try to install with --install-extension
+  # Try to install with --install-extension (codium may use $HOME; run as target user if needed)
   if codium --install-extension "$VSIX_PATH" --force 2>&1; then
     log "✓ Continue extension installed"
     debug_log "install_offline.sh:extensions:continue_success" "Continue extension installed" "{\"status\":\"success\"}" "EXT-A" "run1"
@@ -1267,7 +1328,7 @@ if [[ -n "$VSIX_PATH" ]] && [[ -f "$VSIX_PATH" ]]; then
     log "WARNING: Continue extension installation via CLI failed. Attempting manual unzip..."
     
     # Manual installation fallback: Unzip to ~/.vscode-oss/extensions/
-    EXT_DIR="$HOME/.vscode-oss/extensions/Continue.continue-$(basename "$VSIX_PATH" .vsix | sed 's/Continue.continue-//')"
+    EXT_DIR="$TARGET_HOME/.vscode-oss/extensions/Continue.continue-$(basename "$VSIX_PATH" .vsix | sed 's/Continue.continue-//')"
     mkdir -p "$EXT_DIR"
     
     if unzip -q "$VSIX_PATH" "extension/*" -d "$EXT_DIR" 2>/dev/null; then
@@ -1299,7 +1360,7 @@ if [[ -n "$PYTHON_VSIX" ]] && [[ -f "$PYTHON_VSIX" ]]; then
   else
     log "WARNING: Python extension installation via CLI failed. Attempting manual unzip..."
     
-    EXT_DIR="$HOME/.vscode-oss/extensions/ms-python.python-$(basename "$PYTHON_VSIX" .vsix | sed 's/ms-python.python-//')"
+    EXT_DIR="$TARGET_HOME/.vscode-oss/extensions/ms-python.python-$(basename "$PYTHON_VSIX" .vsix | sed 's/ms-python.python-//')"
     mkdir -p "$EXT_DIR"
     
     if unzip -q "$PYTHON_VSIX" "extension/*" -d "$EXT_DIR" 2>/dev/null; then
@@ -1332,7 +1393,7 @@ if [[ -n "$RUST_VSIX" ]] && [[ -f "$RUST_VSIX" ]]; then
   else
     log "WARNING: Rust Analyzer extension installation via CLI failed. Attempting manual unzip..."
     
-    EXT_DIR="$HOME/.vscode-oss/extensions/rust-lang.rust-analyzer-$(basename "$RUST_VSIX" .vsix | sed 's/rust-lang.rust-analyzer-//')"
+    EXT_DIR="$TARGET_HOME/.vscode-oss/extensions/rust-lang.rust-analyzer-$(basename "$RUST_VSIX" .vsix | sed 's/rust-lang.rust-analyzer-//')"
     mkdir -p "$EXT_DIR"
     
     if unzip -q "$RUST_VSIX" "extension/*" -d "$EXT_DIR" 2>/dev/null; then
@@ -1394,7 +1455,7 @@ if [[ -n "$RUSTUP_INIT" ]]; then
           source "$HOME/.cargo/env"
           
           # Safely add to shell profile
-          local rc_file="$HOME/.bashrc"
+          rc_file="$HOME/.bashrc"
           [[ -n "$ZSH_VERSION" ]] && rc_file="$HOME/.zshrc"
           
           if ! grep -q "cargo/env" "$rc_file"; then
@@ -1527,7 +1588,7 @@ if [[ -d "$BUNDLE_DIR/python/site-packages" ]]; then
   # Detect Python version
   if command -v python3 >/dev/null 2>&1; then
     PY_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-    USER_SITE="$HOME/.local/lib/python$PY_VER/site-packages"
+    USER_SITE="$TARGET_HOME/.local/lib/python$PY_VER/site-packages"
     
     log "Detected Python $PY_VER"
     log "Target directory: $USER_SITE"
@@ -1535,6 +1596,7 @@ if [[ -d "$BUNDLE_DIR/python/site-packages" ]]; then
     mkdir -p "$USER_SITE"
     
     if cp -r "$BUNDLE_DIR/python/site-packages/"* "$USER_SITE/" 2>/dev/null; then
+      [[ "$(id -u)" -eq 0 ]] && [[ -n "$TARGET_USER" ]] && chown -R "$TARGET_USER:$TARGET_USER" "$TARGET_HOME/.local/lib" 2>/dev/null || true
       mark_success "python"
       log "✓ Python packages installed successfully"
       debug_log "install_offline.sh:python:success" "Python packages copied successfully" "{\"target\":\"$USER_SITE\"}" "PYTHON-A" "run1"
@@ -1608,6 +1670,315 @@ else
 fi
 
 # ============
+# 10) Install CUDA Toolkit 12.8+ (for RTX 5070 Ti Blackwell GPU)
+# ============
+CUDA_DIR="$BUNDLE_DIR/cuda"
+log ""
+log "Checking for CUDA Toolkit in bundle..."
+
+if [[ ! -d "$CUDA_DIR" ]] || [[ -z "$(ls -A "$CUDA_DIR" 2>/dev/null)" ]]; then
+  log "NOTE: No CUDA Toolkit found in bundle ($CUDA_DIR). Skipping."
+  log "      To add CUDA support, re-run get_bundle.sh on a connected machine."
+  mark_skipped "cuda"
+  debug_log "install_offline.sh:cuda:skipped" "No CUDA Toolkit in bundle" "{\"status\":\"skipped\"}" "CUDA-A" "run1"
+  # #region agent log
+  printf '{"sessionId":"643f5d","runId":"run1","hypothesisId":"H2","location":"install_offline.sh:cuda_dir_empty","message":"CUDA dir empty or missing","data":{"cuda_dir":"%s","exists":%s},"timestamp":%s}\n' "$CUDA_DIR" "$(test -d "$CUDA_DIR" && echo true || echo false)" "$(date +%s)000" >> "/mnt/t7/airgapped_llm/.cursor/debug-643f5d.log" 2>/dev/null || true
+  # #endregion
+else
+  # Detect installer type — prefer .run (fully self-contained) over .deb (metapackage, needs internet)
+  CUDA_RUN=$(find "$CUDA_DIR" -maxdepth 1 -name "*.run" 2>/dev/null | head -n1)
+  CUDA_DEB=$(find "$CUDA_DIR" -maxdepth 1 -name "*.deb" 2>/dev/null | head -n1)
+  # #region agent log
+  CUDA_DIR_LISTING=$(ls -lh "$CUDA_DIR" 2>/dev/null | tr '\n' '|' | tr '"' "'")
+  printf '{"sessionId":"643f5d","runId":"run1","hypothesisId":"H2","location":"install_offline.sh:cuda_dir_contents","message":"CUDA dir contents","data":{"cuda_run":"%s","cuda_deb":"%s","listing":"%s"},"timestamp":%s}\n' "${CUDA_RUN:-none}" "${CUDA_DEB:-none}" "$CUDA_DIR_LISTING" "$(date +%s)000" >> "/mnt/t7/airgapped_llm/.cursor/debug-643f5d.log" 2>/dev/null || true
+  # #endregion
+
+  if [[ -n "$CUDA_RUN" ]]; then
+    log "Installing CUDA Toolkit from .run installer: $(basename "$CUDA_RUN")"
+    log "(This installs toolkit only — not samples or the bundled driver)"
+    chmod +x "$CUDA_RUN"
+    if sudo "$CUDA_RUN" --silent --toolkit 2>&1; then
+      log "✓ CUDA Toolkit .run installer completed"
+      mark_success "cuda"
+      debug_log "install_offline.sh:cuda:run_success" "CUDA Toolkit .run installed" "{\"file\":\"$CUDA_RUN\",\"status\":\"success\"}" "CUDA-C" "run1"
+    else
+      log "WARNING: CUDA .run installer failed."
+      log "  - Check logs: /var/log/cuda-installer.log"
+      mark_failed "cuda"
+      debug_log "install_offline.sh:cuda:run_failed" "CUDA Toolkit .run failed" "{\"file\":\"$CUDA_RUN\",\"status\":\"failed\"}" "CUDA-C" "run1"
+    fi
+  elif [[ -n "$CUDA_DEB" ]]; then
+    log "Installing CUDA Toolkit from .deb package: $(basename "$CUDA_DEB")"
+    log "NOTE: This is a metapackage — it may have unresolved dependencies offline."
+    if sudo dpkg -i "$CUDA_DEB" 2>&1; then
+      log "✓ CUDA Toolkit .deb installed"
+      mark_success "cuda"
+      debug_log "install_offline.sh:cuda:deb_success" "CUDA Toolkit .deb installed" "{\"file\":\"$CUDA_DEB\",\"status\":\"success\"}" "CUDA-B" "run1"
+    else
+      log "WARNING: CUDA .deb install failed (likely missing deps — prefer .run installer)."
+      mark_failed "cuda"
+      debug_log "install_offline.sh:cuda:deb_failed" "CUDA Toolkit .deb failed" "{\"file\":\"$CUDA_DEB\",\"status\":\"failed\"}" "CUDA-B" "run1"
+    fi
+  fi
+
+  if [[ -z "$CUDA_RUN" ]] && [[ -z "$CUDA_DEB" ]]; then
+    log "WARNING: CUDA directory exists but no installer found inside it."
+    mark_skipped "cuda"
+    debug_log "install_offline.sh:cuda:no_installer" "No installer found in cuda dir" "{\"status\":\"skipped\"}" "CUDA-A" "run1"
+  fi
+
+  # Verify installation
+  if [[ "$(get_status cuda)" == "success" ]]; then
+    if command -v nvcc >/dev/null 2>&1; then
+      NVCC_VER=$(nvcc --version 2>/dev/null | grep "release" | sed 's/.*release \([0-9.]*\).*/\1/' || echo "unknown")
+      log "✓ CUDA Toolkit installed — nvcc version: $NVCC_VER"
+      debug_log "install_offline.sh:cuda:verified" "CUDA Toolkit verified" "{\"nvcc_version\":\"$NVCC_VER\"}" "CUDA-D" "run1"
+    else
+      log "NOTE: CUDA installed but nvcc not yet in PATH. You may need to:"
+      log "  export PATH=/usr/local/cuda/bin:\$PATH"
+    fi
+  fi
+fi
+
+# ============
+# 11) Install NVIDIA Driver 570.x+ (open kernel module)
+# ============
+NVIDIA_DIR="$BUNDLE_DIR/nvidia-driver"
+log ""
+log "Checking for NVIDIA Driver packages in bundle..."
+
+if [[ ! -d "$NVIDIA_DIR" ]] || [[ -z "$(ls -A "$NVIDIA_DIR" 2>/dev/null)" ]]; then
+  log "NOTE: No NVIDIA driver packages found in bundle ($NVIDIA_DIR). Skipping."
+
+  # Check if a compatible driver is already present
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    EXISTING_DRIVER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 || echo "")
+    if [[ -n "$EXISTING_DRIVER" ]]; then
+      DRIVER_MAJOR=$(echo "$EXISTING_DRIVER" | cut -d. -f1)
+      if [[ "$DRIVER_MAJOR" -ge 570 ]]; then
+        log "✓ NVIDIA Driver $EXISTING_DRIVER already installed (570+). No action needed."
+        mark_success "nvidia_driver"
+      else
+        log "WARNING: NVIDIA Driver $EXISTING_DRIVER installed but < 570 (required for RTX 5070 Ti)."
+        log "         Use Pop!_OS driver manager to upgrade: sudo apt install system76-driver-nvidia"
+        mark_failed "nvidia_driver"
+      fi
+    else
+      mark_skipped "nvidia_driver"
+    fi
+  else
+    mark_skipped "nvidia_driver"
+  fi
+  debug_log "install_offline.sh:nvidia_driver:skipped" "No NVIDIA driver packages in bundle" "{\"status\":\"$(get_status nvidia_driver)\"}" "NVIDIA-A" "run1"
+else
+  DEB_COUNT=$(find "$NVIDIA_DIR" -maxdepth 1 -name "*.deb" | wc -l)
+  if [[ $DEB_COUNT -eq 0 ]]; then
+    log "NOTE: NVIDIA driver directory exists but no .deb packages found. Skipping."
+    mark_skipped "nvidia_driver"
+    debug_log "install_offline.sh:nvidia_driver:no_debs" "No .deb packages in nvidia-driver dir" "{\"status\":\"skipped\"}" "NVIDIA-A" "run1"
+  else
+    log "Installing $DEB_COUNT NVIDIA driver package(s)..."
+    # Install all .deb packages in dependency order
+    if sudo dpkg -i "$NVIDIA_DIR"/*.deb 2>&1; then
+      log "✓ NVIDIA driver packages installed"
+      mark_success "nvidia_driver"
+      debug_log "install_offline.sh:nvidia_driver:success" "NVIDIA driver installed" "{\"deb_count\":$DEB_COUNT,\"status\":\"success\"}" "NVIDIA-B" "run1"
+    else
+      # dpkg -i can fail with dependency errors; try apt --fix-broken (local only)
+      log "dpkg reported errors. Attempting to fix dependencies from local APT repo..."
+      if sudo apt-get install -f -y --no-install-recommends 2>&1; then
+        log "✓ NVIDIA driver dependencies resolved"
+        mark_success "nvidia_driver"
+        debug_log "install_offline.sh:nvidia_driver:fixed" "NVIDIA driver deps fixed" "{\"status\":\"success\"}" "NVIDIA-B" "run1"
+      else
+        log "WARNING: NVIDIA driver installation failed."
+        log "  After install, use Pop!_OS driver manager to complete driver setup."
+        mark_failed "nvidia_driver"
+        debug_log "install_offline.sh:nvidia_driver:failed" "NVIDIA driver install failed" "{\"status\":\"failed\"}" "NVIDIA-C" "run1"
+      fi
+    fi
+
+    # Verify
+    if [[ "$(get_status nvidia_driver)" == "success" ]]; then
+      if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+        DRIVER_VER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 || echo "unknown")
+        log "✓ NVIDIA Driver verified — version: $DRIVER_VER"
+        debug_log "install_offline.sh:nvidia_driver:verified" "NVIDIA driver verified" "{\"driver_version\":\"$DRIVER_VER\"}" "NVIDIA-D" "run1"
+      else
+        log "NOTE: Driver packages installed. A reboot is required for the driver to take effect."
+        INSTALL_NEEDS_REBOOT="true"
+        INSTALL_REBOOT_STATE="$BUNDLE_DIR/.install_needs_reboot"
+        echo "nvidia_driver" > "$INSTALL_REBOOT_STATE" 2>/dev/null || true
+        log "  After reboot, run: $(dirname "$0")/install_offline.sh --resume"
+        debug_log "install_offline.sh:nvidia_driver:reboot_needed" "Reboot required, state file written" "{\"status\":\"success\",\"state_file\":\"$INSTALL_REBOOT_STATE\"}" "NVIDIA-D" "run1"
+      fi
+    fi
+  fi
+fi
+
+# ============
+# 12) Install Whisper.cpp (voice-to-text)
+# ============
+WHISPER_DIR="$BUNDLE_DIR/whisper"
+WHISPER_INSTALL_DIR="${INSTALL_PREFIX%/bin}/share/whisper.cpp"
+log ""
+log "Checking for Whisper.cpp in bundle..."
+
+if [[ ! -d "$WHISPER_DIR/whisper.cpp" ]]; then
+  log "NOTE: No Whisper.cpp source found in bundle ($WHISPER_DIR/whisper.cpp). Skipping."
+  mark_skipped "whisper"
+  debug_log "install_offline.sh:whisper:skipped" "No Whisper.cpp source in bundle" "{\"status\":\"skipped\"}" "WHISPER-A" "run1"
+else
+  log "Installing Whisper.cpp from bundle..."
+
+  # Copy source to install location
+  sudo mkdir -p "$WHISPER_INSTALL_DIR"
+  if sudo cp -r "$WHISPER_DIR/whisper.cpp/." "$WHISPER_INSTALL_DIR/" 2>&1; then
+    sudo chown -R "$USER:$USER" "$WHISPER_INSTALL_DIR" 2>/dev/null || true
+    log "✓ Whisper.cpp source copied to $WHISPER_INSTALL_DIR"
+    debug_log "install_offline.sh:whisper:copied" "Whisper.cpp source copied" "{\"dest\":\"$WHISPER_INSTALL_DIR\"}" "WHISPER-B" "run1"
+
+    # Check if pre-built binary is present; if not, build from source
+    WHISPER_BIN=""
+    if [[ -f "$WHISPER_INSTALL_DIR/build/bin/main" ]]; then
+      WHISPER_BIN="$WHISPER_INSTALL_DIR/build/bin/main"
+    elif [[ -f "$WHISPER_INSTALL_DIR/main" ]]; then
+      WHISPER_BIN="$WHISPER_INSTALL_DIR/main"
+    fi
+
+    if [[ -n "$WHISPER_BIN" ]]; then
+      log "✓ Pre-built Whisper.cpp binary found at: $WHISPER_BIN"
+      # Symlink to INSTALL_PREFIX and to target user's .local/bin so it's on PATH
+      sudo ln -sf "$WHISPER_BIN" "$INSTALL_PREFIX/whisper" 2>/dev/null || true
+      mkdir -p "$TARGET_HOME/.local/bin"
+      ln -sf "$WHISPER_BIN" "$TARGET_HOME/.local/bin/whisper" 2>/dev/null || true
+      [[ "$(id -u)" -eq 0 ]] && [[ -n "$TARGET_USER" ]] && chown -h "$TARGET_USER:$TARGET_USER" "$TARGET_HOME/.local/bin/whisper" 2>/dev/null || true
+      mark_success "whisper"
+      debug_log "install_offline.sh:whisper:prebuilt" "Pre-built binary installed" "{\"binary\":\"$WHISPER_BIN\",\"status\":\"success\"}" "WHISPER-C" "run1"
+    else
+      log "No pre-built binary found. Building Whisper.cpp from source..."
+      OLD_PWD="$PWD"
+      cd "$WHISPER_INSTALL_DIR" || cd "$OLD_PWD" || true
+
+      if command -v cmake >/dev/null 2>&1; then
+        mkdir -p build
+        cd build || cd "$WHISPER_INSTALL_DIR" || true
+        # Prefer CUBLAS only when GPU is available (nvcc or nvidia-smi)
+        WHISPER_USE_CUBLAS=false
+        if command -v nvcc >/dev/null 2>&1 || (command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1); then
+          WHISPER_USE_CUBLAS=true
+        fi
+        if [[ "$WHISPER_USE_CUBLAS" == "true" ]] && cmake .. -DWHISPER_CUBLAS=ON 2>&1 && make -j$(nproc) 2>&1; then
+          log "✓ Whisper.cpp built successfully (with CUBLAS for GPU acceleration)"
+          WHISPER_BIN_BUILT="$WHISPER_INSTALL_DIR/build/bin/main"
+          sudo ln -sf "$WHISPER_BIN_BUILT" "$INSTALL_PREFIX/whisper" 2>/dev/null || true
+          mkdir -p "$TARGET_HOME/.local/bin" && ln -sf "$WHISPER_BIN_BUILT" "$TARGET_HOME/.local/bin/whisper" 2>/dev/null || true
+          [[ "$(id -u)" -eq 0 ]] && [[ -n "$TARGET_USER" ]] && chown -h "$TARGET_USER:$TARGET_USER" "$TARGET_HOME/.local/bin/whisper" 2>/dev/null || true
+          mark_success "whisper"
+          debug_log "install_offline.sh:whisper:built" "Whisper.cpp built with CUBLAS" "{\"status\":\"success\"}" "WHISPER-D" "run1"
+        elif cmake .. 2>&1 && make -j$(nproc) 2>&1; then
+          log "✓ Whisper.cpp built (CPU only)"
+          WHISPER_BIN_BUILT="$WHISPER_INSTALL_DIR/build/bin/main"
+          sudo ln -sf "$WHISPER_BIN_BUILT" "$INSTALL_PREFIX/whisper" 2>/dev/null || true
+          mkdir -p "$TARGET_HOME/.local/bin" && ln -sf "$WHISPER_BIN_BUILT" "$TARGET_HOME/.local/bin/whisper" 2>/dev/null || true
+          [[ "$(id -u)" -eq 0 ]] && [[ -n "$TARGET_USER" ]] && chown -h "$TARGET_USER:$TARGET_USER" "$TARGET_HOME/.local/bin/whisper" 2>/dev/null || true
+          mark_success "whisper"
+          debug_log "install_offline.sh:whisper:built_cpu" "Whisper.cpp built (CPU only)" "{\"status\":\"success\"}" "WHISPER-D" "run1"
+        else
+          log "WARNING: Whisper.cpp build failed."
+          log "  Install build tools and retry: sudo apt-get install -y cmake build-essential"
+          mark_failed "whisper"
+          debug_log "install_offline.sh:whisper:build_failed" "Whisper.cpp build failed" "{\"status\":\"failed\"}" "WHISPER-E" "run1"
+        fi
+      else
+        log "WARNING: cmake not found. Cannot build Whisper.cpp."
+        log "  Install cmake: sudo apt-get install -y cmake"
+        log "  Then rebuild from: $WHISPER_INSTALL_DIR"
+        mark_failed "whisper"
+        debug_log "install_offline.sh:whisper:no_cmake" "cmake not found" "{\"status\":\"failed\"}" "WHISPER-E" "run1"
+      fi
+      cd "$OLD_PWD" || true
+    fi
+
+    # Check for model file
+    MODEL_FILE=$(find "$WHISPER_INSTALL_DIR/models" -name "ggml-base.en.bin" 2>/dev/null | head -n1)
+    if [[ -n "$MODEL_FILE" ]]; then
+      log "✓ Whisper base.en model found: $MODEL_FILE"
+    else
+      log "NOTE: Whisper base.en model not found in bundle."
+      log "  When internet is available, run: bash $WHISPER_INSTALL_DIR/models/download-ggml-model.sh base.en"
+    fi
+  else
+    log "WARNING: Failed to copy Whisper.cpp to $WHISPER_INSTALL_DIR"
+    mark_failed "whisper"
+    debug_log "install_offline.sh:whisper:copy_failed" "Whisper.cpp copy failed" "{\"dest\":\"$WHISPER_INSTALL_DIR\",\"status\":\"failed\"}" "WHISPER-B" "run1"
+  fi
+fi
+
+# ============
+# 13) Install Obsidian (note-taking application)
+# ============
+OBSIDIAN_DIR="$BUNDLE_DIR/obsidian"
+OBSIDIAN_INSTALL_DIR="$TARGET_HOME/.local/share/obsidian"
+log ""
+log "Checking for Obsidian in bundle..."
+
+if [[ ! -d "$OBSIDIAN_DIR" ]] || [[ -z "$(ls -A "$OBSIDIAN_DIR" 2>/dev/null)" ]]; then
+  log "NOTE: No Obsidian AppImage found in bundle ($OBSIDIAN_DIR). Skipping."
+  mark_skipped "obsidian"
+  debug_log "install_offline.sh:obsidian:skipped" "No Obsidian AppImage in bundle" "{\"status\":\"skipped\"}" "OBSIDIAN-A" "run1"
+else
+  OBSIDIAN_APPIMAGE=$(find "$OBSIDIAN_DIR" -maxdepth 1 -name "Obsidian-*.AppImage" 2>/dev/null | head -n1)
+  if [[ -z "$OBSIDIAN_APPIMAGE" ]]; then
+    log "NOTE: Obsidian directory exists but no .AppImage file found. Skipping."
+    mark_skipped "obsidian"
+    debug_log "install_offline.sh:obsidian:no_appimage" "No Obsidian AppImage found" "{\"status\":\"skipped\"}" "OBSIDIAN-A" "run1"
+  else
+    log "Installing Obsidian from: $(basename "$OBSIDIAN_APPIMAGE")"
+    mkdir -p "$OBSIDIAN_INSTALL_DIR"
+    mkdir -p "$TARGET_HOME/.local/bin"
+
+    OBSIDIAN_DEST="$OBSIDIAN_INSTALL_DIR/$(basename "$OBSIDIAN_APPIMAGE")"
+    cp "$OBSIDIAN_APPIMAGE" "$OBSIDIAN_DEST" 2>&1
+    chmod +x "$OBSIDIAN_DEST"
+
+    # Symlink into target user's .local/bin so 'obsidian' is on PATH
+    ln -sf "$OBSIDIAN_DEST" "$TARGET_HOME/.local/bin/obsidian" 2>/dev/null || \
+      sudo ln -sf "$OBSIDIAN_DEST" "$INSTALL_PREFIX/obsidian" 2>/dev/null || true
+
+    # Create a desktop entry in target user's applications so it appears in the app launcher
+    DESKTOP_DIR="$TARGET_HOME/.local/share/applications"
+    mkdir -p "$DESKTOP_DIR"
+    OBSIDIAN_VER=$(basename "$OBSIDIAN_APPIMAGE" | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' || echo "")
+    cat > "$DESKTOP_DIR/obsidian.desktop" <<DESKTOP_EOF
+[Desktop Entry]
+Name=Obsidian
+Comment=A powerful knowledge base that works on top of a local folder of plain text Markdown files
+Exec=$OBSIDIAN_DEST --no-sandbox %U
+Icon=obsidian
+Terminal=false
+Type=Application
+Categories=Office;TextEditor;
+MimeType=x-scheme-handler/obsidian;
+StartupWMClass=obsidian
+DESKTOP_EOF
+
+    [[ "$(id -u)" -eq 0 ]] && [[ -n "$TARGET_USER" ]] && {
+      chown -R "$TARGET_USER:$TARGET_USER" "$OBSIDIAN_INSTALL_DIR" 2>/dev/null || true
+      chown "$TARGET_USER:$TARGET_USER" "$DESKTOP_DIR/obsidian.desktop" 2>/dev/null || true
+      chown -h "$TARGET_USER:$TARGET_USER" "$TARGET_HOME/.local/bin/obsidian" 2>/dev/null || true
+    }
+    log "✓ Obsidian installed to $OBSIDIAN_DEST"
+    log "✓ Desktop entry created at $DESKTOP_DIR/obsidian.desktop"
+    mark_success "obsidian"
+    debug_log "install_offline.sh:obsidian:success" "Obsidian installed" "{\"dest\":\"$OBSIDIAN_DEST\",\"version\":\"$OBSIDIAN_VER\",\"status\":\"success\"}" "OBSIDIAN-B" "run1"
+
+    # Update desktop database so the launcher appears immediately
+    update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
+  fi
+fi
+
+# ============
 # Restore APT sources (cleanup)
 # ============
 if [[ -n "$APT_SOURCES_BACKUP" ]] && [[ -d "$APT_SOURCES_BACKUP" ]]; then
@@ -1676,12 +2047,16 @@ log ""
 # Report each component
 log "Component Status:"
 log "  APT Repository:     $(get_status apt_repo || echo 'unknown')"
-log "  VSCodium:             $(get_status vscodium || echo 'unknown')"
-log "  Ollama Binary:        $(get_status ollama || echo 'unknown')"
-log "  Ollama Models:        $(get_status models || echo 'unknown')"
-log "  VSCode Extensions:    $(get_status extensions || echo 'unknown')"
-log "  Rust Toolchain:       $(get_status rust || echo 'unknown')"
-log "  Python Packages:      $(get_status python || echo 'unknown')"
+log "  VSCodium:           $(get_status vscodium || echo 'unknown')"
+log "  Ollama Binary:      $(get_status ollama || echo 'unknown')"
+log "  Ollama Models:      $(get_status models || echo 'unknown')"
+log "  VSCode Extensions:  $(get_status extensions || echo 'unknown')"
+log "  Rust Toolchain:     $(get_status rust || echo 'unknown')"
+log "  Python Packages:    $(get_status python || echo 'unknown')"
+log "  CUDA Toolkit:       $(get_status cuda || echo 'unknown')"
+log "  NVIDIA Driver:      $(get_status nvidia_driver || echo 'unknown')"
+log "  Whisper.cpp:        $(get_status whisper || echo 'unknown')"
+log "  Obsidian:           $(get_status obsidian || echo 'unknown')"
 log ""
 
 # Count successes/failures
@@ -1689,7 +2064,7 @@ SUCCESS_COUNT=0
 FAILED_COUNT=0
 SKIPPED_COUNT=0
 
-for component in apt_repo vscodium ollama models extensions rust python; do
+for component in apt_repo vscodium ollama models extensions rust python cuda nvidia_driver whisper obsidian; do
   status=$(get_status "$component" 2>/dev/null || echo "")
   case "$status" in
     success) ((SUCCESS_COUNT++)) ;;
@@ -1712,17 +2087,31 @@ if [[ $FAILED_COUNT -gt 0 ]]; then
   log ""
 fi
 
-log "Next Steps:"
-log " 1. Start Ollama: ollama serve"
-log " 2. Verify GPU (if available):"
-log "    - Check NVIDIA: nvidia-smi"
-log "    - Check CUDA: nvcc --version"
-log "    - Check Ollama logs: tail -f ~/.ollama/logs/server.log"
-log "    - If GPU not detected, set: export OLLAMA_NUM_GPU=1"
-log " 3. Verify Rust: rustc --version (if installed)"
-log " 4. Verify Python: python3 --version && pip3 --version"
-log " 5. Open VSCodium and verify extensions are working"
-log ""
+if [[ "$INSTALL_NEEDS_REBOOT" == "true" ]]; then
+  log "=========================================="
+  log "REBOOT REQUIRED (NVIDIA driver)"
+  log "=========================================="
+  log ""
+  log "NVIDIA driver packages were installed. The driver will not be active until you reboot."
+  log ""
+  log "  1. Reboot now:  sudo reboot"
+  log "  2. After reboot, run:  $(dirname "$0")/install_offline.sh --resume"
+  log ""
+  log "  --resume will run verification and configure Ollama for GPU use."
+  log ""
+else
+  log "Next Steps:"
+  log " 1. Reboot if NVIDIA driver was just installed (required for driver activation)"
+  log " 2. Run the post-install verification script:"
+  log "    bash $(dirname "$0")/verify_install.sh"
+  log " 3. Or verify manually:"
+  log "    - nvcc --version           (should show CUDA 12.8+)"
+  log "    - nvidia-smi               (should show RTX 5070 Ti, driver 570+)"
+  log "    - ollama run dolphin-mistral 'What is 2+2?'  (should respond in <2s)"
+  log " 4. Obsidian: launch from app menu or run: obsidian"
+  log " 5. Whisper.cpp transcription: whisper --model base.en <audio-file>"
+  log ""
+fi
 if [[ -n "${NETWORK_STATE_DIR:-}" ]] && [[ -d "$NETWORK_STATE_DIR" ]]; then
   log "Network Interfaces:"
   log "  - Network interfaces were disabled during installation"
@@ -1736,4 +2125,22 @@ log "  - Console log: $CONSOLE_LOG"
 log "  - Debug log:   $DEBUG_LOG"
 log ""
 
-debug_log "install_offline.sh:complete" "Installation script completed" "{\"success_count\":$SUCCESS_COUNT,\"failed_count\":$FAILED_COUNT,\"skipped_count\":$SKIPPED_COUNT,\"console_log\":\"$CONSOLE_LOG\",\"debug_log\":\"$DEBUG_LOG\"}" "INSTALL-A" "run1"
+debug_log "install_offline.sh:complete" "Installation script completed" "{\"success_count\":$SUCCESS_COUNT,\"failed_count\":$FAILED_COUNT,\"skipped_count\":$SKIPPED_COUNT,\"needs_reboot\":$INSTALL_NEEDS_REBOOT,\"console_log\":\"$CONSOLE_LOG\",\"debug_log\":\"$DEBUG_LOG\"}" "INSTALL-A" "run1"
+
+# ============
+# Run post-install verification (skip if reboot required; run after --resume instead)
+# ============
+if [[ "$INSTALL_NEEDS_REBOOT" != "true" ]]; then
+  VERIFY_SCRIPT="$(cd "$(dirname "$0")" && pwd)/verify_install.sh"
+  if [[ -f "$VERIFY_SCRIPT" ]]; then
+    log ""
+    log "=========================================="
+    log "Running post-install verification..."
+    log "=========================================="
+    bash "$VERIFY_SCRIPT" || true
+  else
+    log ""
+    log "NOTE: verify_install.sh not found at $VERIFY_SCRIPT"
+    log "      Run it manually after installation to confirm everything is working."
+  fi
+fi
