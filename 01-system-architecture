@@ -1,0 +1,112 @@
+# CAAA — System Architecture (Spec 01)
+
+Status: Draft v0.1 · Implements SRS v1.2 §2, §3.1, §3.6 · Companion to Spec 03 (State Schema)
+
+## 1. Purpose
+
+Define the components, threads, IPC, and data flow for CAAA. This is the *how* behind SRS v1.2 (the *what*). It governs every crate in the workspace.
+
+## 2. Deployment topology
+
+CAAA runs on a single **System76 Pop!_OS box** (LAN-only, no WAN egress). One headless daemon owns all state; front-ends are thin and stateless.
+
+| Node | Process | Role |
+|---|---|---|
+| System76 box | `caaa-core` | Headless daemon: LLM, sandbox, audit, state, vault. Owns all ground truth. |
+| System76 box | `caaa-applet` | **Primary** front-end. libcosmic COSMIC panel applet. Renders STATUS_BLOCK + chat. |
+| Mac (optional) | `caaa-client` | Optional TUI front-end over the LAN. Deprioritized. |
+| System76 box | Ollama | Local LLM server on `127.0.0.1:11434`. Model tiers (small/large). |
+| System76 box | Kata + KVM | Category 1 microVM sandbox for generated code. |
+
+Front-ends NEVER hold state, NEVER call the LLM directly, and NEVER write the vault/audit. They send requests and render responses.
+
+## 3. Transport
+
+All front-end ↔ core communication is **mTLS gRPC** (`caaa-proto`).
+
+- A self-signed CA is generated locally at first launch on the box (`~/.local/share/caaa/pki/`). Server + client certs are issued from it. No external PKI, no internet.
+- The applet on the box connects to `127.0.0.1:51515`. The optional Mac client connects to `<box-lan-ip>:51515` and must present a client cert signed by the box CA.
+- Egress policy: the core opens exactly two outbound sockets — Ollama (`127.0.0.1:11434`) and (only during M6+) the Kata runtime. No other network access is permitted; this is the enforced reframing of SRS air-gap (SI-6/SE-4) to "LAN-only, no WAN".
+
+## 4. Component model (`caaa-core`)
+
+```text
+caaa-core (tokio multi-thread runtime)
+├── rpc server (tonic, mTLS)          # accepts front-end requests
+├── orchestrator (per-turn pipeline)  # the single source of turn logic
+│     1. receive user text / command
+│     2. constitution gate (Lisp 1-14)         [M3]
+│     3. build prompt + call LLM tier (Ollama)
+│     4. persona-non-grata filter (Prolog)     [M3]  -> retry/allow
+│     5. extract claims + code blocks
+│     6. (optional) execute in Kata microVM    [M6]
+│     7. taxonomy classify discrepancies (Prolog) [M4]
+│     8. persist state (ledger/history/artifacts)
+│     9. write vault notes if applicable        [M5]
+│    10. COMPUTE STATUS_BLOCK from ground truth
+│    11. emit response + STATUS_BLOCK to front-end
+├── audit thread (std::thread, isolated)        [M2]
+│     - owns exclusive append handle to audit.json
+│     - receives AuditMsg via unbuffered sync_channel(0)
+│     - orchestrator can ONLY send; never calls audit fns
+└── state store (serde_json, atomic write+rename)
+```
+
+### 4.1 STATUS_BLOCK invariant (accessibility-critical)
+
+STATUS_BLOCK is computed in step 10 by the core from persisted ground-truth state — `LAST_ACTION`, `CURRENT_STATE`, `NEXT_STEP`. **The LLM never generates it.** Rationale: the user has 30-second working memory; a hallucinated status is an accessibility failure, not a cosmetic bug. STATUS_BLOCK is attached to *every* response (UI-2/UI-3, AC-1).
+
+### 4.2 Audit isolation (SRS AE-9..AE-12)
+
+The audit thread is a separate OS thread started at boot. The orchestrator holds only the `SyncSender<AuditMsg>` end of an unbuffered channel. The audit thread holds the only open file handle to `audit.json` and appends records. There is no function the orchestrator can call to mutate audit state, so the LLM (driven from the orchestrator) cannot influence the audit trail. Vault writes (M5) are also reported to the audit thread as claims.
+
+## 5. Turn data flow (chat, no execution — M1/M2)
+
+```text
+front-end --SendMessage(text)--> rpc server --> orchestrator
+orchestrator --pre-snapshot--> audit thread (channel)
+orchestrator --HTTP--> Ollama /api/chat (tier model) --> response text
+orchestrator --persist--> ledger.json, history.json
+orchestrator --claim+post-snapshot--> audit thread (channel)
+orchestrator --compute--> STATUS_BLOCK
+rpc server --TurnResponse{reply, status_block, audit_ref}--> front-end
+```
+
+## 6. Crate boundaries
+
+| Crate | Owns | Depends on |
+|---|---|---|
+| `caaa-proto` | gRPC service + message types (tonic/prost) | — |
+| `caaa-state` | JSON schemas + atomic IO (ledger/audit/history/artifacts/status) | — |
+| `caaa-llm` | Ollama client, model-tier selection, `/escalate` | caaa-state |
+| `caaa-audit` | isolated audit thread, channel, claim/reality diff | caaa-state |
+| `caaa-persona` | persona-non-grata filter (Prolog-backed) | caaa-state |
+| `caaa-constitution` | 1-14 commit engine (Lisp-backed) | — |
+| `caaa-taxonomy` | clearing taxonomy classifier (Prolog-backed) | caaa-state |
+| `caaa-sandbox` | Kata/KVM spawn + CV verification (Linux only) | caaa-state |
+| `caaa-vault` | Obsidian vault notes + sync | caaa-state, caaa-audit |
+| `caaa-core` | daemon, orchestrator, rpc server, wiring | all of the above |
+| `caaa-applet` | libcosmic front-end (Linux only) | caaa-proto |
+| `caaa-client` | optional Mac TUI front-end | caaa-proto |
+
+## 7. Threading & runtime
+
+- `caaa-core` uses a Tokio multi-thread runtime for async IO (RPC, Ollama HTTP).
+- The audit thread is a dedicated `std::thread` (not a Tokio task) to guarantee isolation and an independent file handle lifecycle.
+- The orchestrator processes turns sequentially per project (a project has a serialized turn queue) so STATUS_BLOCK transitions are well-ordered. Multiple projects may progress concurrently.
+
+## 8. Failure & recovery (SRS RE-*)
+
+- Ollama disconnect → orchestrator returns an error reply; STATUS_BLOCK `CURRENT_STATE = "LLM unavailable"`, audit records the failure.
+- microVM crash (M6) → execution result marked failed; audit retains pre/post snapshots; no audit loss.
+- Auto-save: state is persisted every turn and on a 30s timer (RE-3).
+
+## 9. Platform notes
+
+- `caaa-sandbox` and `caaa-applet` are Linux-only (`#[cfg(target_os = "linux")]`); on macOS dev they compile as stubs returning `Unsupported` so the workspace builds on the Mac for iteration.
+- Production target: x86_64 Pop!_OS with KVM + Kata, integrated via the `richtobey/airgapped_llm` offline bundle.
+
+## 10. Open items
+
+- Cert rotation policy for the local CA (initial: long-lived, regenerated on `/reset-pki`).
+- Whether the applet links `caaa-core` in-process or always via loopback mTLS gRPC (initial: loopback gRPC for a single code path).
