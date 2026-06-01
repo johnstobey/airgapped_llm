@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/caaa-core",
+    "crates/caaa-applet",
+    "crates/caaa-proto",
+    "crates/caaa-pki",
+    "crates/caaa-reasoning",
+    "crates/caaa-constitution",
+    "crates/caaa-vault",
+    "crates/caaa-audit",
+    "crates/caaa-ctl",
+    "crates/caaa-recover",
+    "crates/caaa-sandbox"
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["CAAA Engineering Team"]
+license = "MIT"
+repository = "https://github.com/johnstobey/airgapped_llm"
+
+# Strict dependency pinning for air-gap reproducibility
+[workspace.dependencies]
+tonic = "0.11.0"
+prost = "0.12.0"
+tokio = { version = "1.35.0", features = ["full"] }
+serde = { version = "1.0.195", features = ["derive"] }
+serde_json = "1.0.111"
+thiserror = "1.0.56"
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+rcgen = "0.12.0" # For PKI generation
+x509-parser = "0.15.0"
+libcosmic = { git = "https://github.com/pop-os/libcosmic", rev = "unstable" } # Pinned to specific commit in production
+iced = { version = "0.12.0", features = ["tokio"] } # Fallback if libcosmic fails
+swipl = "0.4.0" # SWI-Prolog FFI (unused if subprocess, kept for optionality)
+tiny-lisp = "0.3.0" # Tiny Lisp (unused if subprocess)
+nix = { version = "0.27.1", features = ["user", "fs"] } # For sandboxing/namespaces
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
