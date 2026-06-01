@@ -1,0 +1,140 @@
+# COSMIC Accessible Agent Applet (CAAA) — Build Plan
+
+Build CAAA as a headless Rust core (LLM + Kata/KVM sandbox + audit + state + Obsidian vault) running on the System76 Pop!_OS box behind a native libcosmic applet, with an optional Mac client over mTLS gRPC, reconciling your SRS v1.2 contradictions and producing the missing implementation specs before code.
+
+---
+
+## 1. What we are building (and what already exists)
+
+CAAA is an accessibility-first agent: **one linear text chat, no spatial UI**, that compensates for visual-spatial deficit, 30-second working memory, and dyslexia, while refusing the substitution/hedging/gaslighting failure mode you documented across 40+ sessions.
+
+- **Your SRS v1.2 is the requirements contract** — correct and kept. It says *what*. This plan adds the *how* (the "missing blueprint" you correctly identified).
+- **`richtobey/airgapped_llm` is the environment, not the app.** It bundles Ollama + VSCodium + Continue + models + vendored Python wheels / Rust crates for an air-gapped System76 box, plus a Mac UTM/QEMU test VM and UTM→KVM migration scripts. **CAAA drops in to replace the VSCodium+Continue editor** — reusing the bundle's offline Ollama, vendored-crate offline `cargo build`, and Pop!_OS target.
+
+## 2. Resolved decisions (from your answers)
+
+| Topic | Decision |
+|---|---|
+| Form factor | Native **COSMIC `libcosmic` applet** is the System76 target; **no Electron** |
+| Where it runs | **Headless `caaa-core` daemon on the System76 box** (owns Ollama, Kata/KVM, audit, state, workspace, **Obsidian vault**); primary front-end is the **libcosmic applet on the box** |
+| Mac client | **Optional, deprioritized.** Connects over LAN when wanted, but not required for the core to function |
+| LLM | "Hybrid" reframed as **local-network model tiers**: small/fast vs large Ollama model on the box; `/escalate` switches tier (audited). **No cloud.** |
+| Network | **LAN-only.** No WAN egress. Air-gap (SI-6/SE-4) reframed as "no internet; only Ollama host + (optional) front-end RPC on the LAN." |
+| LAN transport | **mTLS gRPC** (mutual auth + encryption + typed contract; explicit egress policy). Chosen over SSH tunnel. |
+| Obsidian vault | **First-class subsystem.** Core manages a vault: specs, decision logs, pattern extraction, STATUS_BLOCK history — written for the user via natural language, never hand-navigated |
+| Languages | Rust = shipping binaries; **Prolog = taxonomy + persona rules**; **Lisp = constitutional 1-14 engine**; **Python = offline audit analysis + provisioning glue**; **TypeScript = out-of-band dev tooling only** (never in the applet) |
+
+## 3. Target architecture
+
+```
+ (optional) MAC client                      SYSTEM76 BOX (Pop!_OS / COSMIC, LAN-only)
+ ┌──────────────────┐    mTLS gRPC        ┌──────────────────────────────────────┐
+ │ caaa-client      │ ◄─────────────────► │ caaa-core (headless Rust daemon)       │
+ │  (TUI, optional) │   (LAN, no WAN)     │  ├─ LLM provider  → Ollama :11434      │
+ └──────────────────┘                     │  ├─ Sandbox       → Kata microVM (KVM)  │
+                                          │  ├─ Audit thread  → unbuffered channel │
+  PRIMARY front-end:                       │  │     exclusive handle → audit.json    │
+ ┌──────────────────┐   in-process /       │  ├─ State/ledger/artifacts (JSON)      │
+ │ libcosmic applet │   local mTLS gRPC    │  ├─ Persona filter → Prolog rules       │
+ │  on the box      │ ◄─────────────────► │  ├─ Taxonomy       → Prolog rules       │
+ │  renders         │                     │  ├─ Constitution   → Lisp 1-14 engine  │
+ │  STATUS_BLOCK    │                     │  └─ Obsidian vault → specs/logs/patterns│
+ └──────────────────┘                     └──────────────────────────────────────┘
+```
+
+**Key invariants**
+- **STATUS_BLOCK is computed by `caaa-core` from ground-truth state, never by the LLM.** A 30-second-memory user must never be shown a model-hallucinated status. (Reliability + accessibility both demand this.)
+- **Audit thread is isolated** (SRS AE-9..AE-12): separate thread, unbuffered channel in, exclusive file handle, no callable surface to the LLM handler.
+- **Single source of truth on the box**: ledger/audit/artifacts/workspace/**Obsidian vault** live with `caaa-core` so the libcosmic applet and any optional Mac client see identical state.
+- **Vault writes go through the audit thread**: every spec/decision-log/pattern the core writes to the Obsidian vault is a claim that is recorded and diffed against reality (no silent vault edits).
+
+### Language placement (deliberate)
+| Language | Role | Integration |
+|---|---|---|
+| **Rust** | `caaa-core` daemon, libcosmic applet, optional `caaa-client` | shipping binaries; offline `cargo build --offline` via vendored crates |
+| **Prolog** | Clearing taxonomy (Level 1-6) + persona-non-grata pattern rules as a declarative KB | embed `scryer-prolog` (pure Rust, single-binary friendly) or `swipl` subprocess |
+| **Lisp** | Constitutional layer: evaluate 1-14 commits / "1-14: True" affirmation logic | embedded Scheme (`steel`) or `sbcl` subprocess; mirrors your `past_performance` Lisp engines |
+| **Python** | Offline audit analysis, taxonomy metrics, SHA-256 model-import verify, bundle glue | CLI tools shipped via airgap wheels; not in the hot path |
+| **TypeScript** | Dev-only: spec/doc generation, artifact inspection during development | never compiled into the applet (honors SRS DC-2 "no JS") |
+
+## 4. Repository layout (`/Users/jacobcavazos/Projects/cosmic-accessible-agent-applet`)
+
+```
+caaa/
+├── Cargo.toml                 # workspace
+├── crates/
+│   ├── caaa-core/             # daemon: orchestration, state, RPC server
+│   ├── caaa-llm/              # Ollama client, model-tier/escalation
+│   ├── caaa-sandbox/          # Kata/KVM spawn + CV-1..CV-11 verification
+│   ├── caaa-audit/            # isolated audit thread + channel + claim/reality diff
+│   ├── caaa-persona/          # persona-non-grata filter (Prolog-backed)
+│   ├── caaa-constitution/     # 1-14 engine (Lisp-backed)
+│   ├── caaa-taxonomy/         # clearing taxonomy classifier (Prolog-backed)
+│   ├── caaa-state/            # ledger/artifacts/history JSON schemas + IO
+│   ├── caaa-vault/            # Obsidian vault: specs, decision logs, patterns, sync
+│   ├── caaa-proto/            # mTLS gRPC service + message types (shared)
+│   ├── caaa-client/           # OPTIONAL Mac thin client (TUI)
+│   └── caaa-applet/           # libcosmic COSMIC applet (PRIMARY front-end)
+├── rules/
+│   ├── persona.pl             # PNG pattern rules
+│   ├── taxonomy.pl            # Level 1-6 classification rules
+│   └── constitution.lisp      # 1-14 commit logic
+├── tools/                     # Python: audit analysis, model-import verify
+├── specs/                     # Phase 0 documents (see §5)
+├── config/                    # config.toml schema + defaults
+└── docs/                      # user manual, deployment manual
+```
+
+## 5. Phase 0 — the missing specification documents (the blueprint)
+
+You correctly named these as missing. We author them in `specs/` **before** building each subsystem, kept short and implementation-driving:
+
+1. **System Architecture Document** — components, threads, IPC/channel model, LAN RPC, sequence diagrams (chat turn, code-exec turn, escalation).
+2. **API / RPC Specification** — Ollama integration, `caaa-proto` message schemas (client↔core), error model.
+3. **Database / State Schema** — exact JSON for `ledger.json`, `audit.json`, `history.json`, `artifacts/<id>/data.json` (formalizes SRS DB-1..DB-5).
+4. **UI/UX Specification** — STATUS_BLOCK layout/fields, output formatting, TUI key bindings, command grammar (UI-1..UI-10, TM-1..TM-6).
+5. **Obsidian Vault Spec** — vault folder layout, note templates (spec/decision-log/pattern), naming, frontmatter, sync/conflict rules, audit-on-write.
+6. **Security & Containment Model** — Category 1 verification (CV-1..CV-11), audit isolation, **mTLS gRPC cert/identity model + LAN-only egress policy**, privilege separation.
+7. **Deployment Manual** — folding CAAA into the `airgapped_llm` bundle (Kata install, KVM/`kvm` group, USB SHA-256 model import MP-1..MP-7).
+8. **Test Plan** — unit/integration/accessibility/air-gap matrix mapped to SRS §4.
+9. **Constitutional Layer Document** — the 1-14 commits, persona patterns, rejection/retry/`/allow` logic (PNG-1..PNG-10), clearing taxonomy reference.
+10. **User Manual** — commands, workflows, troubleshooting (dyslexia-aware: summarized, collapsed traces).
+
+## 6. Implementation roadmap
+
+**Vertical-slice MVP first** — a single end-to-end accessible chat turn with trustworthy STATUS_BLOCK and audit, before adding microVM execution.
+
+| Milestone | Deliverable | SRS coverage |
+|---|---|---|
+| **M0 Scaffold** | Cargo workspace, config.toml, **mTLS gRPC** service + cert provisioning + handshake, offline build via vendored crates | DC-1, MA-1 |
+| **M1 Accessible chat** | Ollama tier query over LAN; **core-computed STATUS_BLOCK**; linear output; `/help`, `/status`, `/menu` | UI-1..UI-10, AC-1..AC-6, PE-2 |
+| **M2 State + audit** | ledger/history/artifacts JSON; **isolated audit thread** + claim/reality diff (no exec yet) | PM-1..PM-5, AE-1..AE-12, AL-1..AL-8 |
+| **M3 Persona + constitution** | Prolog persona filter + Lisp 1-14 engine; reject/retry/`/allow`; rejection logging | NL-1..NL-5, PNG-1..PNG-10 |
+| **M4 Taxonomy** | Prolog Level 1-6 classifier; alert on L5/L6; `/menu→AUDIT` metrics | DC (3.2.9), FL-4 |
+| **M5 Obsidian vault** | `caaa-vault`: NL-driven spec/decision-log/pattern notes; vault sync; audit-on-write | brief: vault mgmt, pattern extraction, decision logging |
+| **M6 Category 1 exec** | Kata/KVM spawn on box, CV-1..CV-11 verification + breach recovery, timeout/output caps | CE-1..CE-10, CV-1..CV-11, SE-1..SE-4 |
+| **M7 Provisioning** | USB SHA-256 model import; fold into `airgapped_llm` bundle; deployment manual | MP-1..MP-7, A-1..A-6 |
+| **M8 libcosmic applet** | Native COSMIC front-end on the box reusing `caaa-core`; panel icon, popup, badges | FL-1..FL-7, UI-* |
+| **M9 (optional) Mac client** | TUI over mTLS gRPC; deprioritized | UI-*, AC-* |
+
+## 7. SRS v1.2 reconciliations (defects to fix in the spec)
+
+- **Air-gap vs Hybrid (resolved → LAN-only).** Update SI-6/DC-4/SE-4 to "no internet egress; LAN-restricted to Ollama host + front-end RPC." Escalation = local model tier swap, not cloud.
+- **"Output ONLY code, no explanations" (Appendix B) vs accessibility.** The persona filter governs **LLM task output** (suppress hedging/refusal). **STATUS_BLOCK, error summaries, and TUI are system-generated by `caaa-core`**, not the model — so they are exempt and reliable. Clarify this boundary in the Constitutional Layer Document.
+- **Duplicate ID namespace.** `DC-*` is used for both *Discrepancy Classification* (§3.2.9) and *Design Constraints* (§3.6). Rename §3.6 to `DZ-*` (or `CON-*`) to remove collision.
+- **"Single static binary" (DC-3) vs daemon+applet(+optional client).** Becomes **a small set of static binaries** (`caaa-core`, `caaa-applet`, optional `caaa-client`). Note the amendment.
+- **Obsidian vault not in SRS v1.2 requirement tables** though present in your brief. Add a `VL-*` requirement group (vault layout, NL note creation, pattern extraction, decision logging, sync, audit-on-write).
+- **Embedded vs subprocess for Prolog/Lisp.** Prefer embedded (`scryer-prolog`, `steel`) to preserve near-single-binary + offline; fall back to `swipl`/`sbcl` subprocess only if rule expressiveness requires it.
+
+## 8. Risks & open items
+
+- **Kata/KVM on the box**: confirm CPU virt (VT-x/AMD-V), `kvm` group, nested virt if the box is itself a VM.
+- **LAN transport** — RESOLVED: **mTLS gRPC**. Open sub-item: cert provisioning/storage on the air-gapped box (self-signed CA generated locally at install).
+- **Embedded Prolog/Lisp maturity** for the exact rule logic — validate in M3/M4 spike.
+- **Obsidian vault location** — confirm the vault path on the box (default `~/CAAA/vault`) and whether an existing vault should be adopted.
+
+## 9. First concrete steps (on approval)
+
+1. Author `specs/01-system-architecture.md` and `specs/03-state-schema.md` (smallest blast radius, unblock M0/M1).
+2. Scaffold the Cargo workspace + `config.toml` + `caaa-proto` **mTLS gRPC** service + local CA/cert provisioning (M0).
+3. Stand up M1 accessible chat against the box's Ollama with core-computed STATUS_BLOCK.
