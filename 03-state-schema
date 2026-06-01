@@ -1,0 +1,150 @@
+# CAAA — State & Database Schema (Spec 03)
+
+Status: Draft v0.1 · Formalizes SRS v1.2 §3.4 (DB-1..DB-5) and §3.2.4/3.2.5/3.2.6 · Implemented by crate `caaa-state`
+
+## 1. Principles
+
+- All persistent state is **human-readable JSON** (DB-5), readable by `jq`/`cat` (MA-4).
+- Writes are **atomic**: write to `*.tmp`, `fsync`, then `rename` over the target.
+- `audit.json` is **append-only** and written **only** by the isolated audit thread (AE-1, AE-12).
+- Timestamps are RFC 3339 UTC strings (e.g. `2026-05-29T06:40:00Z`).
+- IDs: artifacts use an 8-char lowercase hex hash (AL-2); audit/history records use a UUIDv4.
+
+## 2. Filesystem layout
+
+```text
+~/.local/share/caaa/
+├── pki/                      # local CA + server/client certs (mTLS)
+├── config.toml               # see Spec/Appendix C
+└── projects/
+    └── <project>/
+        ├── ledger.json       # DB-1
+        ├── audit.json        # DB-2 (append-only, audit thread only)
+        ├── history.json      # DB-3
+        ├── artifacts/
+        │   └── <id>/data.json  # DB-4
+        ├── vault/            # Obsidian vault (Spec 05)
+        └── workspace/        # files the agent creates/edits + exec cwd
+```
+
+## 3. STATUS_BLOCK (computed, not stored as truth)
+
+The STATUS_BLOCK is derived each turn from `ledger.json`. It is serialized to the front-end and mirrored into `ledger` for restart continuity, but the ledger fields are the source of truth.
+
+```json
+{
+  "last_action": "Created file workspace/main.rs",
+  "current_state": "Idle — awaiting input",
+  "next_step": "Type a task or /menu",
+  "project": "main",
+  "turn": 12,
+  "computed_at": "2026-05-29T06:40:00Z"
+}
+```
+
+## 4. ledger.json (DB-1)
+
+```json
+{
+  "project": "main",
+  "created_at": "2026-05-29T06:00:00Z",
+  "updated_at": "2026-05-29T06:40:00Z",
+  "turn": 12,
+  "last_action": "Created file workspace/main.rs",
+  "current_state": "Idle — awaiting input",
+  "next_step": "Type a task or /menu",
+  "tasks": [
+    { "id": "t1", "text": "scaffold project", "status": "done" },
+    { "id": "t2", "text": "add tests", "status": "pending" }
+  ],
+  "model_tier": "small",
+  "persona_strictness": "standard"
+}
+```
+
+`status` ∈ {`pending`, `in_progress`, `done`, `blocked`}.
+`model_tier` ∈ {`small`, `large`}. `persona_strictness` ∈ {`standard`, `strict`, `extreme`}.
+
+## 5. audit.json (DB-2, append-only)
+
+A JSON array; the audit thread appends one record per event. Records are never modified (LC-4); overrides are appended as new records.
+
+```json
+{
+  "id": "f1e2d3c4-...",
+  "timestamp": "2026-05-29T06:40:00Z",
+  "kind": "turn",
+  "prompt": "create main.rs that prints hello",
+  "claim": "Created workspace/main.rs (12 lines)",
+  "reality": "workspace/main.rs exists, sha256=ab12…, 12 lines",
+  "discrepancy": false,
+  "severity": 0,
+  "pre_snapshot": { "files": { "workspace/main.rs": null }, "git": null },
+  "post_snapshot": { "files": { "workspace/main.rs": "ab12…" }, "git": null },
+  "meta": {}
+}
+```
+
+Field rules:
+
+- `kind` ∈ {`turn`, `rejection`, `execution`, `vault_write`, `override`, `containment`, `model_import`, `error`}.
+- `severity` is the clearing-taxonomy level **0–6** (0 = no discrepancy; 1–6 per SRS §3.2.9). Levels 5–6 raise the applet alert badge (FL-4, DC-5).
+- `discrepancy` is `true` whenever `claim` and `reality` diverge.
+- `rejection` records (persona/constitution) include `meta.pattern` and `meta.retry`.
+- `override` records include `meta.artifact_id` and `meta.reason` (LC-1..LC-3) and never delete the original.
+
+## 6. history.json (DB-3)
+
+```json
+[
+  {
+    "timestamp": "2026-05-29T06:40:00Z",
+    "turn": 12,
+    "prompt": "create main.rs that prints hello",
+    "artifact_id": "9af3b1c2",
+    "output_summary": "Created workspace/main.rs"
+  }
+]
+```
+
+## 7. artifacts/<id>/data.json (DB-4)
+
+Every generated code block is saved as an artifact (AL-1..AL-3).
+
+```json
+{
+  "id": "9af3b1c2",
+  "created_at": "2026-05-29T06:40:00Z",
+  "prompt": "create main.rs that prints hello",
+  "language": "rust",
+  "code": "fn main() { println!(\"hello\"); }",
+  "output": null,
+  "exit_code": null,
+  "executed": false,
+  "overridden": false
+}
+```
+
+Retention (AL-6): keep the most recent **1000** artifacts or **90 days**, whichever is larger window, configurable. Export (AL-7) copies `artifacts/<id>/` to `/media/caaa-transfer/exports/<id>/` plus a `SHA256SUMS` manifest (AL-8).
+
+## 8. Rust type mapping (`caaa-state`)
+
+| JSON file | Rust type |
+|---|---|
+| STATUS_BLOCK | `StatusBlock` |
+| ledger.json | `Ledger` (+ `Task`) |
+| audit.json record | `AuditRecord` (+ `AuditKind`, `Snapshot`) |
+| history.json item | `HistoryEntry` |
+| artifacts/<id>/data.json | `Artifact` |
+
+All derive `serde::{Serialize, Deserialize}`; enums use `#[serde(rename_all = "snake_case")]`. Atomic write via `caaa_state::io::write_json_atomic(path, &value)`.
+
+## 9. Concurrency
+
+- One serialized turn queue per project guarantees ledger/history writes are ordered.
+- `audit.json` is touched only by the audit thread; all other files are written by the orchestrator. No file is written by two owners.
+
+## 10. Open items
+
+- Snapshot scope for large workspaces (initial: hash only files the turn claims to touch + git HEAD if a repo).
+- Whether to compress rotated artifacts beyond retention (initial: delete on rotation, audit the deletion).
